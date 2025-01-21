@@ -91,15 +91,12 @@ def print_report(report_data):
         print(f"\n{'IP Address:':<15}{ip}")
         print(f"{'ASN:':<15}{report['ASN'] or 'Not Available'}")
 
-        # Вывод DNS Associations
         dns_info = ', '.join(report['DNS Associations']) if report['DNS Associations'] else 'None'
         print(f"{'DNS Associations:':<15}{dns_info}")
 
-        # Вывод SNI Records
         sni_info = ', '.join(report['SNI Records']) if report['SNI Records'] else 'None'
         print(f"{'SNI Records:':<15}{sni_info}")
-
-        # Выводим статистику по пакетам
+        
         if report['Packet Statistics']:
             print(f"\n{'Packet Statistics:':<15}")
             for packet_type, count in report['Packet Statistics'].items():
