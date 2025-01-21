@@ -11,8 +11,13 @@ IP-адресов. Также поддерживается сравнение д
 3. pip install -r requirements.txt
 
 ## Примеры использования
-Анализ одного pcap-файла: python3 main.py your_pcap_file.pcap
-Получение уникального траффика плагина: python3 main.py base_pcap.pcap --compare plugin_pcap.pcap
-Генерация JSON-отчета: python3 main.py your_pcap_file.pcap --json report.json
-Генерация HTML-отчета: python3 main.py your_pcap_file.pcap --html report.html
-Фильтрация пакетов по типу: python3 main.py your_pcap_file.pcap --filter DNS
+### Анализ одного pcap-файла: 
+python3 main.py your_pcap_file.pcap
+### Получение уникального траффика плагина: 
+python3 main.py base_pcap.pcap --compare plugin_pcap.pcap
+### Генерация JSON-отчета: 
+python3 main.py your_pcap_file.pcap --json report.json
+### Генерация HTML-отчета: 
+python3 main.py your_pcap_file.pcap --html report.html
+### Фильтрация пакетов по типу: 
+python3 main.py your_pcap_file.pcap --filter DNS
