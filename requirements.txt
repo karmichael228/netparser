@@ -1,0 +1,5 @@
+scapy
+tqdm
+pyasn
+pyshark
+jinja2
