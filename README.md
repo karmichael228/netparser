@@ -13,7 +13,7 @@ IP-адресов. Также поддерживается сравнение д
 ## Примеры использования
 ### Анализ одного pcap-файла: 
 python3 main.py your_pcap_file.pcap
-### Получение уникального траффика плагина: 
+### Сравнение двух pcap файлов: 
 python3 main.py base_pcap.pcap --compare plugin_pcap.pcap
 ### Генерация JSON-отчета: 
 python3 main.py your_pcap_file.pcap --json report.json
