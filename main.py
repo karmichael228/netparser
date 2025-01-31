@@ -13,16 +13,8 @@ def main():
 
     # Если задан флаг сравнения
     if args.compare:
-        base_parser = NetParser()
-        plugin_parser = NetParser()
-        unique_traffic = compare_traffic(args.pcap_file, args.compare, base_parser, plugin_parser)
-        print("\nUnique Traffic (only in plugin traffic):")
-        for ip, details in unique_traffic.items():
-            print(f"\nIP: {ip}")
-            print(f"  ASN: {details['ASN']}")
-            print(f"  DNS Associations: {details['DNS Associations']}")
-            print(f"  SNI Records: {details['SNI Records']}")
-        
+        unique_traffic = compare_traffic(args.pcap_file, args.compare)
+        print_report(unique_traffic)
         if args.json:
             generate_report(args.json, unique_traffic)
         if args.html:
@@ -37,8 +29,6 @@ def main():
         net_parser = NetParser()
         data = net_parser.analyze(args.pcap_file, filters=filters)
         report_data = net_parser.get_dict()
-
-        # Выводим отчет через отдельную функцию
         print_report(report_data)
 
         if args.json:
