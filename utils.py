@@ -1,7 +1,10 @@
 import json
 from jinja2 import Template
+from netparser import NetParser
 
-def compare_traffic(pcap_base_file, pcap_plugin_file, base_parser, plugin_parser):
+def compare_traffic(pcap_base_file, pcap_plugin_file):
+    base_parser = NetParser()
+    plugin_parser = NetParser()
     base_parser.analyze(pcap_base_file)
     base_traffic = base_parser.get_dict()
 
