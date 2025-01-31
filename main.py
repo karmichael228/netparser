@@ -13,7 +13,9 @@ def main():
 
     # Если задан флаг сравнения
     if args.compare:
-        unique_traffic = compare_traffic(args.pcap_file, args.compare)
+        base_parser = NetParser()
+        plugin_parser = NetParser()
+        unique_traffic = compare_traffic(args.pcap_file, args.compare, base_parser, plugin_parser)
         print("\nUnique Traffic (only in plugin traffic):")
         for ip, details in unique_traffic.items():
             print(f"\nIP: {ip}")
