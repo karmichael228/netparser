@@ -5,6 +5,8 @@ import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any, Dict, Set, Generator, List
+
+# Импортируем необходимые классы из Scapy
 from scapy.all import (
     IP, TCP, UDP, ICMP, DNS, DNSQR, DNSRR, PcapReader, Packet, Raw
 )
@@ -24,10 +26,8 @@ class Logger:
     def setup_logger() -> logging.Logger:
         logger = logging.getLogger("NetParser")
         logger.setLevel(logging.DEBUG)
-        # Консольный обработчик
         info_console_handler = logging.StreamHandler(sys.stdout)
         info_console_handler.setLevel(logging.INFO)
-        # Файловый обработчик для ошибок
         file_handler = logging.FileHandler('error.log', mode='w', encoding='utf-8')
         file_handler.setLevel(logging.WARNING)
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -78,8 +78,8 @@ class NetParser:
         self.dns_records: Dict[str, Set[Any]] = defaultdict(set)
         self.ip_list_conn: Set[str] = set()
         self.g_ip_sni: Dict[str, Set[str]] = defaultdict(set)
-        # Новый словарь для доменных имен из HTTP-запросов
         self.http_domains: Dict[str, Set[str]] = defaultdict(set)
+        self.http_requests: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         self.asn_database = ASNDatabase(asndb_path, as_names_file)
         self.packet_statistics: Dict[str, int] = {
             "total_packets": 0,
@@ -91,25 +91,53 @@ class NetParser:
             "dns_count": 0,
             "total_bytes": 0
         }
+        # Для каждого IP будет храниться протокольная статистика, а также трафик (вход/выход)
         self.output_data: Dict[str, Dict[str, int]] = {}
         self.data_lock = threading.Lock()
 
     @staticmethod
     def _normalize_ipv4(ip: str) -> str:
-        """
-        Normalizes IPv4 addresses if they are in ::ffff: format.
-        """
+        """Нормализует IPv4 адрес, если он записан в формате ::ffff:x.x.x.x"""
         if re.match(r"^::ffff:\d+\.\d+\.\d+\.\d+$", ip):
             return ip.split(":")[-1]
         return ip
 
+    def parse_http_request(self, payload: str) -> Optional[Dict[str, str]]:
+        """
+        Парсит HTTP запрос из полезной нагрузки и извлекает основные поля.
+        Возвращает словарь с ключами: method, uri, version, host, user_agent.
+        Если строка не соответствует формату HTTP запроса, возвращает None.
+        """
+        lines = payload.splitlines()
+        if not lines:
+            return None
+        request_line_pattern = re.compile(r"^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/\d\.\d)")
+        match = request_line_pattern.match(lines[0])
+        if not match:
+            return None
+        http_data = {
+            "method": match.group(1),
+            "uri": match.group(2),
+            "version": match.group(3),
+            "host": "",
+            "user_agent": ""
+        }
+        for line in lines[1:]:
+            if ':' not in line:
+                continue
+            header, value = line.split(":", 1)
+            header = header.strip().lower()
+            value = value.strip()
+            if header == "host":
+                http_data["host"] = value
+            elif header == "user-agent":
+                http_data["user_agent"] = value
+        return http_data
+
     def handle_dns_pkt(self, pkt: Packet) -> None:
-        """
-        Processes DNS packets to extract DNS records.
-        """
+        """Извлекает DNS записи из пакета."""
         try:
             if DNSQR in pkt:
-                # Process DNS queries (record names)
                 for query in pkt[DNSQR]:
                     qname = query.qname.decode() if query.qname else '<UNKNOWN>'
                     with self.data_lock:
@@ -124,9 +152,7 @@ class NetParser:
             self.logger.exception("Error handling DNS packet:")
 
     def extract_sni_pyshark(self, pcap_file: str) -> None:
-        """
-        Extracts SNI from TLS packets using pyshark.
-        """
+        """Извлекает SNI из TLS пакетов с помощью pyshark."""
         try:
             cap = pyshark.FileCapture(
                 pcap_file,
@@ -140,7 +166,6 @@ class NetParser:
                     with self.data_lock:
                         self.g_ip_sni[ip].add(sni)
                 except AttributeError:
-                    # Packet might not have SNI or IP layer; skip it.
                     continue
                 except Exception:
                     self.logger.exception("Unexpected error while processing SNI in packet:")
@@ -159,18 +184,15 @@ class NetParser:
     def process_packets(self, packets: List[Packet],
                         filters: Optional[Callable[[Packet], bool]] = None) -> None:
         """
-        Processes packets considering filters and updates statistics.
+        Обрабатывает пакеты, обновляет общую статистику, а также статистику по каждому IP.
+        Сохраняет информацию по входящему/исходящему трафику и протоколам.
         """
-        # Регулярка для извлечения домена из HTTP-заголовка
-        host_pattern = re.compile(r"Host:\s*([^\r\n]+)", re.IGNORECASE)
-
         for pkt in packets:
             with self.data_lock:
                 self.packet_statistics["total_packets"] += 1
                 self.packet_statistics["total_bytes"] += len(pkt)
             if filters and not filters(pkt):
                 continue
-
             if IP in pkt:
                 ip_src = self._normalize_ipv4(pkt[IP].src)
                 ip_dst = self._normalize_ipv4(pkt[IP].dst)
@@ -178,30 +200,36 @@ class NetParser:
                     self.ip_list_conn.update([ip_src, ip_dst])
                     self.output_data.setdefault(ip_src, defaultdict(int))
                     self.output_data.setdefault(ip_dst, defaultdict(int))
-                
+                    # Обновляем счетчики трафика по направлениям
+                    self.output_data[ip_src]["packets_out"] += 1
+                    self.output_data[ip_src]["bytes_out"] += len(pkt)
+                    self.output_data[ip_dst]["packets_in"] += 1
+                    self.output_data[ip_dst]["bytes_in"] += len(pkt)
                 if TCP in pkt:
                     with self.data_lock:
                         self.packet_statistics["tcp_count"] += 1
                         self.output_data[ip_src]["tcp_count"] += 1
                         self.output_data[ip_dst]["tcp_count"] += 1
-                    # Обработка HTTP-трафика (порт 80) для извлечения доменных имён
                     if pkt[TCP].dport == 80:
                         with self.data_lock:
                             self.packet_statistics["http_count"] += 1
                         if pkt.haslayer(Raw):
                             try:
                                 raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
-                                host_match = host_pattern.search(raw_payload)
+                                host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
                                 if host_match:
                                     host = host_match.group(1).strip()
                                     with self.data_lock:
                                         self.http_domains[ip_dst].add(host)
+                                http_data = self.parse_http_request(raw_payload)
+                                if http_data:
+                                    with self.data_lock:
+                                        self.http_requests[ip_dst].append(http_data)
                             except Exception:
-                                self.logger.exception("Error extracting HTTP Host header:")
+                                self.logger.exception("Error extracting HTTP request details:")
                     elif pkt[TCP].dport == 443:
                         with self.data_lock:
                             self.packet_statistics["https_count"] += 1
-
                 elif UDP in pkt:
                     with self.data_lock:
                         self.packet_statistics["udp_count"] += 1
@@ -212,7 +240,6 @@ class NetParser:
                         self.packet_statistics["icmp_count"] += 1
                         self.output_data[ip_src]["icmp_count"] += 1
                         self.output_data[ip_dst]["icmp_count"] += 1
-
                 if DNS in pkt:
                     with self.data_lock:
                         self.packet_statistics["dns_count"] += 1
@@ -224,7 +251,7 @@ class NetParser:
                             num_threads: int = 4,
                             filters: Optional[Callable[[Packet], bool]] = None) -> None:
         """
-        Processes packets in parallel using multiple threads with a progress bar.
+        Обрабатывает пакеты в параллельном режиме с использованием нескольких потоков и отображает progress bar.
         """
         def packet_iterator() -> Generator[Packet, None, None]:
             try:
@@ -254,7 +281,7 @@ class NetParser:
     def analyze(self, pcap_file: str,
                 filters: Optional[Callable[[Packet], bool]] = None) -> Dict[str, Any]:
         """
-        Main method for analyzing a PCAP file.
+        Основной метод для анализа PCAP файла.
         """
         self.logger.info("[*] Starting PCAP analysis...")
         self.process_in_parallel(pcap_file, filters=filters)
@@ -263,8 +290,10 @@ class NetParser:
 
     def get_dict(self) -> Dict[str, Any]:
         """
-        Returns a dictionary containing IP addresses, their associations with DNS, HTTP, SNI and ASN.
-        Also includes overall packet statistics.
+        Возвращает итоговый словарь, содержащий для каждого IP:
+         - "Traffic": статистика входящих/исходящих пакетов и байтов,
+         - "Protocols": статистика по протоколам.
+        Также включается общая статистика по всем пакетам и детальные HTTP запросы (с удалением дубликатов).
         """
         ip_dns_sni_map: Dict[str, Any] = {}
         with self.data_lock:
@@ -272,20 +301,31 @@ class NetParser:
         for ip in ips:
             ip_norm = self._normalize_ipv4(ip)
             with self.data_lock:
-                # Получаем DNS ассоциации, если IP встречается в значениях
-                dns_associations = sorted(
-                    qname for qname, records in self.dns_records.items() if ip_norm in records
-                )
+                dns_associations = sorted(qname for qname, records in self.dns_records.items() if ip_norm in records)
                 sni_records = sorted(self.g_ip_sni.get(ip_norm, []))
                 http_hosts = sorted(self.http_domains.get(ip_norm, []))
-                packet_stats = dict(self.output_data.get(ip_norm, {}))
+                # Разбиваем статистику: трафик и протоколы
+                raw_stats = dict(self.output_data.get(ip_norm, {}))
+            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"] if k in raw_stats}
+            protocol_stats = {k: v for k, v in raw_stats.items() if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
+            with self.data_lock:
+                http_reqs = self.http_requests.get(ip_norm, [])
+            # Удаляем дубликаты HTTP запросов
+            unique_reqs = {}
+            for req in http_reqs:
+                key = tuple(sorted(req.items()))
+                if key not in unique_reqs:
+                    unique_reqs[key] = req
+            unique_http_reqs = list(unique_reqs.values())
             asn = self.asn_database.lookup_asn(ip_norm)
             ip_dns_sni_map[ip_norm] = {
                 "ASN": asn,
                 "DNS Associations": dns_associations,
                 "SNI Records": sni_records,
                 "HTTP Domains": http_hosts,
-                "Packet Statistics": packet_stats
+                "HTTP Requests": unique_http_reqs,
+                "Traffic": traffic_stats,
+                "Protocols": protocol_stats
             }
         with self.data_lock:
             ip_dns_sni_map["Overall Packet Statistics"] = dict(self.packet_statistics)
