@@ -14,9 +14,6 @@ def ip_sort_key(ip: str) -> tuple:
 
 
 def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any]:
-    """
-    Сравнивает трафик между двумя PCAP-файлами и возвращает уникальный трафик из второго файла.
-    """
     base_parser = NetParser()
     plugin_parser = NetParser()
     base_parser.analyze(pcap_base_file)
@@ -61,6 +58,7 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 "DNS Associations": sorted(unique_dns),
                 "DNS Queries by Server": unique_dns_queries_by_server if unique_dns_queries_by_server else None,
                 "DNS Responses": plugin_data.get("DNS Responses", []),
+                "DNS Resolution Chains": plugin_data.get("DNS Resolution Chains", []),
                 "SNI Records": sorted(unique_sni),
                 "HTTP Domains": sorted(unique_http_domains),
                 "HTTP Requests": unique_http_reqs,
@@ -81,9 +79,6 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
 
 
 def generate_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Генерирует JSON-отчёт и сохраняет его по указанному пути.
-    """
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     print(f"[*] Report saved to '{output_path}'")
@@ -91,14 +86,8 @@ def generate_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Генерирует HTML-отчёт с отдельными таблицами:
-      - Для клиентов: таблица DNS Queries by Server.
-      - Для DNS-серверов: таблица DNS Responses.
-    """
     ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
     sorted_ips = sorted(ip_keys, key=ip_sort_key)
-
     html_template = """
     <!DOCTYPE html>
     <html>
@@ -195,14 +184,24 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, An
                         </table>
                     </div>
                     {% endif %}
+                    {% if report.get("DNS Resolution Chains") %}
+                    <div class="section">
+                        <h2>DNS Resolution Chains</h2>
+                        <ul class="data-list">
+                            {% for chain in report["DNS Resolution Chains"] %}
+                            <li>{{ chain }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
                     <ul class="data-list">
-                        <li><strong>HTTP Domains:</strong> {{ report['HTTP Domains'] | join(', ') if report['HTTP Domains'] else 'None' }}</li>
-                        <li><strong>SNI Records:</strong> {{ report['SNI Records'] | join(', ') if report['SNI Records'] else 'None' }}</li>
+                        <li><strong>HTTP Domains:</strong> {{ report["HTTP Domains"] | join(', ') if report["HTTP Domains"] else "None" }}</li>
+                        <li><strong>SNI Records:</strong> {{ report["SNI Records"] | join(', ') if report["SNI Records"] else "None" }}</li>
                     </ul>
                     <div class="section">
                         <h2>Traffic (Packets/Bytes)</h2>
                         <ul class="data-list">
-                            {% for key, value in report['Traffic'].items() %}
+                            {% for key, value in report["Traffic"].items() %}
                             <li><strong>{{ key.replace('_', ' ').title() }}:</strong> {{ value }}</li>
                             {% endfor %}
                         </ul>
@@ -210,16 +209,16 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, An
                     <div class="section">
                         <h2>Protocols</h2>
                         <ul class="data-list">
-                            {% for key, value in report['Protocols'].items() %}
+                            {% for key, value in report["Protocols"].items() %}
                             <li><strong>{{ key.replace('_', ' ').title() }}:</strong> {{ value }}</li>
                             {% endfor %}
                         </ul>
                     </div>
-                    {% if report['HTTP Requests'] and report['HTTP Requests']|length > 0 %}
+                    {% if report["HTTP Requests"] and report["HTTP Requests"]|length > 0 %}
                     <div class="section">
                         <h2>HTTP Requests</h2>
                         <ul class="data-list">
-                            {% for req in report['HTTP Requests'] %}
+                            {% for req in report["HTTP Requests"] %}
                             <li>
                                 <strong>Method:</strong> {{ req.method }},
                                 <strong>URI:</strong> {{ req.uri }},
@@ -232,7 +231,7 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, An
                     <div class="section">
                         <h2>HTTP URI Links</h2>
                         <div class="link-list">
-                            {% for req in report['HTTP Requests'] %}
+                            {% for req in report["HTTP Requests"] %}
                                 {% if req.host and req.uri %}
                                     {% set url = "http://" + req.host + req.uri %}
                                     <a href="{{ url }}" target="_blank">{{ url }}</a>
@@ -300,6 +299,10 @@ def print_report(report_data: Dict[str, Any]) -> None:
             for entry in report['DNS Responses']:
                 print(f"  | {entry['name']:<15} | {entry['type']:<5} | {entry['resolution']:<15} |")
             print("  +-----------------+-------+-----------------+")
+        if report.get("DNS Resolution Chains"):
+            print(f"{'DNS Resolution Chains:':<15}")
+            for chain in report["DNS Resolution Chains"]:
+                print(f"  {chain}")
         print(f"{'HTTP Domains:':<15}{', '.join(report.get('HTTP Domains', [])) if report.get('HTTP Domains') else 'None'}")
         print(f"{'SNI Records:':<15}{', '.join(report.get('SNI Records', [])) if report.get('SNI Records') else 'None'}")
         print("\nTraffic (Packets/Bytes):")
