@@ -75,7 +75,7 @@ class NetParser:
         self.http_domains: Dict[str, Set[str]] = defaultdict(set)
         self.http_requests: Dict[str, List[Dict[str, str]]] = defaultdict(list)
         self.dns_associations: Dict[str, Set[str]] = defaultdict(set)
-        self.g_ip_sni: Dict[str, Set[str]] = defaultdict(set)
+        self.sni_by_ip: Dict[str, Set[str]] = defaultdict(set)
         self.output_data: Dict[str, Dict[str, int]] = {}
         self.ip_list_conn: Set[str] = set()
         self.asn_database = ASNDatabase(asndb_path, as_names_file)
@@ -90,6 +90,10 @@ class NetParser:
             "total_bytes": 0
         }
         self.data_lock = threading.Lock()
+        # Для клиентов – сохраняем DNS запросы с указанием DNS сервера
+        self.dns_queries_by_server: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
+        # Для DNS серверов – таблица ответов (NAME, TYPE, RESOLUTION)
+        self.dns_response_table: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     @staticmethod
     def _normalize_ipv4(ip: str) -> str:
@@ -102,6 +106,14 @@ class NetParser:
     def _is_valid_ipv4(ip: str) -> bool:
         """Проверяет, является ли строка корректным IPv4 адресом."""
         return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip))
+
+    @staticmethod
+    def _ip_sort_key(ip: str) -> tuple:
+        """Ключ для сортировки IP адресов по числовому значению."""
+        try:
+            return tuple(int(part) for part in ip.split('.'))
+        except Exception:
+            return (9999,)
 
     def parse_http_request(self, payload: str) -> Optional[Dict[str, str]]:
         """
@@ -138,40 +150,84 @@ class NetParser:
     def handle_dns_pkt(self, pkt: Packet) -> None:
         """
         Извлекает DNS записи из пакета.
-        Если в ответе (DNSRR) обнаружен корректный IPv4 адрес в поле rdata,
-        то добавляет доменное имя (rrname) в ассоциации для данного IP.
+        Для клиента – сохраняет список DNS запросов с указанием DNS сервера.
+        Для DNS сервера – формирует таблицу ответов (NAME, TYPE, RESOLUTION).
+        При этом трафик mDNS (UDP порт 5353) игнорируется, чтобы не нарушать классификацию.
         """
         try:
+            # Если пакет содержит mDNS (UDP порт 5353), пропускаем его
+            if UDP in pkt and (pkt[UDP].sport == 5353 or pkt[UDP].dport == 5353):
+                return
+
             dns_layer = pkt.getlayer(DNS)
-            if dns_layer:
-                if dns_layer.qdcount and dns_layer.qd:
-                    queries = dns_layer.qd if isinstance(dns_layer.qd, list) else [dns_layer.qd]
+            if not dns_layer:
+                return
+
+            # Обработка DNS запросов от клиента
+            if dns_layer.qdcount and dns_layer.qd:
+                queries = dns_layer.qd if isinstance(dns_layer.qd, list) else [dns_layer.qd]
+                ip_src = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
+                ip_dst = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
+                with self.data_lock:
                     for query in queries:
-                        pass
-                if dns_layer.ancount and dns_layer.an:
-                    answers = dns_layer.an if isinstance(dns_layer.an, list) else [dns_layer.an]
+                        if hasattr(query, 'qname') and query.qname:
+                            qname = query.qname.decode() if isinstance(query.qname, bytes) else query.qname
+                            self.dns_queries_by_server[ip_src][ip_dst].add(qname)
+
+            # Обработка DNS ответов (для DNS серверов)
+            if dns_layer.qr == 1 and dns_layer.ancount and dns_layer.an:
+                dns_server_ip = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
+                answers = dns_layer.an if isinstance(dns_layer.an, list) else [dns_layer.an]
+
+                temp_responses: Dict[str, Dict[str, Any]] = {}
+                with self.data_lock:
                     for answer in answers:
-                        if answer.rrname:
-                            rrname = answer.rrname.decode() if isinstance(answer.rrname, bytes) else answer.rrname
-                        else:
-                            rrname = '<UNKNOWN>'
+                        rrname = (answer.rrname.decode() if isinstance(answer.rrname, bytes)
+                                  else answer.rrname) if answer.rrname else '<UNKNOWN>'
                         rdata = answer.rdata
                         if isinstance(rdata, bytes):
                             rdata = rdata.decode(errors='ignore')
-                        # Если rdata является корректным IPv4 адресом, сохраняем ассоциацию
+                        # Если rdata выглядит как IPv4, добавляем ассоциацию
                         if rdata and self._is_valid_ipv4(rdata):
-                            with self.data_lock:
-                                self.dns_associations[rdata].add(rrname)
+                            self.dns_associations[rdata].add(rrname)
+
+                        ans_type = getattr(answer, 'type', 'UNKNOWN')
+                        type_str = 'A' if ans_type == 1 else 'CNAME' if ans_type == 5 else str(ans_type)
+                        ans_value = rdata if rdata else "<NO_DATA>"
+
+                        if rrname not in temp_responses:
+                            temp_responses[rrname] = {
+                                "name": rrname,
+                                "type": type_str,
+                                "resolution": {ans_value} if type_str == 'A' else ans_value
+                            }
+                        else:
+                            if type_str == 'A' and temp_responses[rrname]["type"] == 'A':
+                                if not isinstance(temp_responses[rrname]["resolution"], set):
+                                    temp_responses[rrname]["resolution"] = {temp_responses[rrname]["resolution"]}
+                                temp_responses[rrname]["resolution"].add(ans_value)
+                            elif type_str != temp_responses[rrname]["type"]:
+                                temp_responses[rrname] = {
+                                    "name": rrname,
+                                    "type": type_str,
+                                    "resolution": {ans_value} if type_str == 'A' else ans_value
+                                }
+                    for entry in temp_responses.values():
+                        if isinstance(entry["resolution"], set):
+                            entry["resolution"] = ", ".join(sorted(entry["resolution"]))
+                        self.dns_response_table[dns_server_ip].append({
+                            "name": entry["name"],
+                            "type": entry["type"],
+                            "resolution": entry["resolution"]
+                        })
         except Exception:
             self.logger.exception("Error handling DNS packet:")
 
     def extract_sni_scapy(self, pcap_file: str) -> None:
         """
         Извлекает SNI из TLS-пакетов, используя Scapy для чтения pcap файла
-        и ручной разбор TLS ClientHello. Функция обрабатывает все TLS записи,
-        содержащие handshake, и пытается найти расширение SNI.
+        и ручной разбор TLS ClientHello.
         """
-        from scapy.all import PcapReader, TCP, IP, Raw
         try:
             with PcapReader(pcap_file) as reader:
                 for pkt in reader:
@@ -179,22 +235,15 @@ class NetParser:
                         raw_payload = pkt[Raw].load
                         sni = self.extract_sni_from_tls(raw_payload)
                         if sni:
-                            if IP in pkt:
-                                ip = self._normalize_ipv4(pkt[IP].dst)
-                            elif hasattr(pkt, 'IPv6'):
-                                ip = pkt.IPv6.dst
-                            else:
-                                ip = '<UNKNOWN>'
+                            ip = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
                             with self.data_lock:
-                                self.g_ip_sni[ip].add(sni)
+                                self.sni_by_ip[ip].add(sni)
         except Exception:
             self.logger.exception("Error extracting SNI using Scapy.")
 
     def extract_sni_from_tls(self, data: bytes) -> Optional[str]:
         """
-        Пытается извлечь SNI из набора TLS записей, найденных в данных.
-        Обрабатывает несколько TLS записей и handshake-сообщений.
-        Возвращает SNI (хостнейм) или None, если SNI не найден.
+        Пытается извлечь SNI из набора TLS записей.
         """
         pos = 0
         while pos + 5 <= len(data):
@@ -202,8 +251,8 @@ class NetParser:
             rec_length = int.from_bytes(data[pos+3:pos+5], 'big')
             record_end = pos + 5 + rec_length
             if record_end > len(data):
-                break 
-            if content_type != 22:  
+                break
+            if content_type != 22:  # Handshake
                 pos = record_end
                 continue
             handshake_pos = pos + 5
@@ -212,8 +261,8 @@ class NetParser:
                 handshake_length = int.from_bytes(data[handshake_pos+1:handshake_pos+4], 'big')
                 handshake_end = handshake_pos + 4 + handshake_length
                 if handshake_end > record_end:
-                    break 
-                if handshake_type == 1:  
+                    break
+                if handshake_type == 1:  # ClientHello
                     client_hello = data[handshake_pos+4:handshake_end]
                     sni = self._parse_client_hello(client_hello)
                     if sni:
@@ -224,44 +273,24 @@ class NetParser:
 
     def _parse_client_hello(self, client_hello: bytes) -> Optional[str]:
         """
-        Разбирает TLS ClientHello и пытается извлечь SNI (расширение server_name).
-        Возвращает SNI (хостнейм) или None, если SNI не найден.
-        
-        Структура ClientHello (базовая):
-          - client_version: 2 байта
-          - random: 32 байта
-          - session_id_length: 1 байт + session_id (переменная длина)
-          - cipher_suites_length: 2 байта + cipher_suites (переменная длина)
-          - compression_methods_length: 1 байт + compression_methods (переменная длина)
-          - extensions_length: 2 байта + extensions (переменная длина)
-          
-        В расширениях ищется расширение с типом 0 (server_name).
+        Разбирает TLS ClientHello и извлекает SNI.
         """
         pos = 0
         if len(client_hello) < 34:
             return None
-        pos += 34 
+        pos += 34
         if pos + 1 > len(client_hello):
             return None
         session_id_length = client_hello[pos]
-        pos += 1
-        if pos + session_id_length > len(client_hello):
-            return None
-        pos += session_id_length
+        pos += 1 + session_id_length
         if pos + 2 > len(client_hello):
             return None
         cipher_suites_length = int.from_bytes(client_hello[pos:pos+2], 'big')
-        pos += 2
-        if pos + cipher_suites_length > len(client_hello):
-            return None
-        pos += cipher_suites_length
+        pos += 2 + cipher_suites_length
         if pos + 1 > len(client_hello):
             return None
         comp_methods_length = client_hello[pos]
-        pos += 1
-        if pos + comp_methods_length > len(client_hello):
-            return None
-        pos += comp_methods_length
+        pos += 1 + comp_methods_length
         if pos + 2 > len(client_hello):
             return None
         extensions_length = int.from_bytes(client_hello[pos:pos+2], 'big')
@@ -275,38 +304,27 @@ class NetParser:
             ext_length = int.from_bytes(client_hello[pos+2:pos+4], 'big')
             pos += 4
             if pos + ext_length > end_ext:
-                return None 
-            if ext_type == 0: 
-                if ext_length < 2:
-                    return None
-                server_name_list_length = int.from_bytes(client_hello[pos:pos+2], 'big')
+                break
+            if ext_type == 0:  # Server Name extension
                 inner_pos = pos + 2
                 inner_end = pos + ext_length
                 while inner_pos + 3 <= inner_end:
                     name_type = client_hello[inner_pos]
                     name_length = int.from_bytes(client_hello[inner_pos+1:inner_pos+3], 'big')
                     inner_pos += 3
-                    if inner_pos + name_length > inner_end:
-                        break
-                    if name_type == 0: 
+                    if inner_pos + name_length <= inner_end and name_type == 0:
                         try:
                             return client_hello[inner_pos:inner_pos+name_length].decode('utf-8')
                         except UnicodeDecodeError:
                             return None
                     inner_pos += name_length
-                return None
-            else:
-                pos += ext_length
+            pos += ext_length
         return None
 
     def process_packets(self, packets: List[Packet],
                         filters: Optional[Callable[[Packet], bool]] = None) -> None:
         """
-        Обрабатывает список пакетов:
-          - Обновляет общую статистику (количество пакетов, байты)
-          - Сохраняет информацию о трафике для каждого IP
-          - Парсит HTTP запросы, обновляет статистику протоколов
-          - Вызывает обработку DNS пакетов
+        Обрабатывает список пакетов: обновляет статистику и парсит данные.
         """
         for pkt in packets:
             with self.data_lock:
@@ -330,24 +348,21 @@ class NetParser:
                         self.packet_statistics["tcp_count"] += 1
                         self.output_data[ip_src]["tcp_count"] += 1
                         self.output_data[ip_dst]["tcp_count"] += 1
-                    # HTTP
-                    if pkt[TCP].dport == 80:
+                    if pkt[TCP].dport == 80 and pkt.haslayer(Raw):
                         with self.data_lock:
                             self.packet_statistics["http_count"] += 1
-                        if pkt.haslayer(Raw):
-                            try:
-                                raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
-                                host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
-                                if host_match:
-                                    host = host_match.group(1).strip()
-                                    with self.data_lock:
-                                        self.http_domains[ip_dst].add(host)
-                                http_data = self.parse_http_request(raw_payload)
-                                if http_data:
-                                    with self.data_lock:
-                                        self.http_requests[ip_dst].append(http_data)
-                            except Exception:
-                                self.logger.exception("Error extracting HTTP request details:")
+                        try:
+                            raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
+                            host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
+                            if host_match:
+                                with self.data_lock:
+                                    self.http_domains[ip_dst].add(host_match.group(1).strip())
+                            http_data = self.parse_http_request(raw_payload)
+                            if http_data:
+                                with self.data_lock:
+                                    self.http_requests[ip_dst].append(http_data)
+                        except Exception:
+                            self.logger.exception("Error extracting HTTP request details:")
                     elif pkt[TCP].dport == 443:
                         with self.data_lock:
                             self.packet_statistics["https_count"] += 1
@@ -373,7 +388,6 @@ class NetParser:
                             filters: Optional[Callable[[Packet], bool]] = None) -> None:
         """
         Параллельно обрабатывает пакеты из PCAP файла.
-        Читает файл чанками и отправляет обработку в пул потоков.
         """
         def packet_iterator() -> Generator[Packet, None, None]:
             try:
@@ -405,10 +419,7 @@ class NetParser:
     def analyze(self, pcap_file: str,
                 filters: Optional[Callable[[Packet], bool]] = None) -> Dict[str, Any]:
         """
-        Основной метод анализа PCAP файла:
-          - Обрабатывает пакеты (Scapy)
-          - Извлекает SNI (ручной разбор TLS ClientHello)
-          - Возвращает собранные данные
+        Основной метод анализа PCAP файла.
         """
         self.logger.info("[*] Starting PCAP analysis...")
         self.process_in_parallel(pcap_file, filters=filters)
@@ -417,36 +428,46 @@ class NetParser:
 
     def get_dict(self) -> Dict[str, Any]:
         """
-        Возвращает итоговый словарь, где для каждого IP указаны:
-          - ASN
-          - DNS Associations (из DNS ответов)
-          - SNI Records
-          - HTTP Domains и уникальные HTTP Requests
-          - Traffic и Protocols статистика
-        Также включается общая статистика по пакетам.
+        Возвращает итоговый словарь с данными по IP.
+        Для клиента выводится только таблица "DNS Queries by Server".
+        Для DNS сервера – только таблица "DNS Responses".
+        Остальные данные (ASN, DNS Associations, SNI, HTTP, трафик) собираются как прежде.
         """
         ip_dns_sni_map: Dict[str, Any] = {}
         with self.data_lock:
-            ips = list(self.ip_list_conn)
+            ips = sorted(list(self.ip_list_conn), key=self._ip_sort_key)
         for ip in ips:
             ip_norm = self._normalize_ipv4(ip)
             with self.data_lock:
                 dns_assocs = sorted(list(self.dns_associations.get(ip_norm, [])))
-                sni_records = sorted(list(self.g_ip_sni.get(ip_norm, [])))
+                sni_records = sorted(list(self.sni_by_ip.get(ip_norm, [])))
                 http_hosts = sorted(list(self.http_domains.get(ip_norm, [])))
                 raw_stats = dict(self.output_data.get(ip_norm, {}))
-            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"] if k in raw_stats}
-            protocol_stats = {k: v for k, v in raw_stats.items() if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
+                dns_queries = self.dns_queries_by_server.get(ip_norm, {})
+                dns_resps = self.dns_response_table.get(ip_norm, [])
+            # Если для IP есть DNS Responses (и более одного запроса не свидетельствует о mDNS),
+            # то считаем его DNS-сервером
+            if dns_resps and len(dns_resps) > 1:
+                dns_info = {"DNS Responses": dns_resps}
+            # Если DNS Responses отсутствуют, а есть DNS Queries – считаем IP клиентом
+            elif dns_queries:
+                dns_info = {"DNS Queries by Server": {server_ip: sorted(list(queries))
+                                                        for server_ip, queries in dns_queries.items()}}
+            else:
+                dns_info = {}
+            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"]
+                             if k in raw_stats}
+            protocol_stats = {k: v for k, v in raw_stats.items()
+                              if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
             with self.data_lock:
                 http_reqs = self.http_requests.get(ip_norm, [])
             unique_reqs = {}
             for req in http_reqs:
                 key = tuple(sorted(req.items()))
-                if key not in unique_reqs:
-                    unique_reqs[key] = req
+                unique_reqs.setdefault(key, req)
             unique_http_reqs = list(unique_reqs.values())
             asn = self.asn_database.lookup_asn(ip_norm)
-            ip_dns_sni_map[ip_norm] = {
+            ip_data = {
                 "ASN": asn,
                 "DNS Associations": dns_assocs,
                 "SNI Records": sni_records,
@@ -455,6 +476,8 @@ class NetParser:
                 "Traffic": traffic_stats,
                 "Protocols": protocol_stats
             }
+            ip_data.update(dns_info)
+            ip_dns_sni_map[ip_norm] = ip_data
         with self.data_lock:
             ip_dns_sni_map["Overall Packet Statistics"] = dict(self.packet_statistics)
         return ip_dns_sni_map
