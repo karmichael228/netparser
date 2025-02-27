@@ -92,7 +92,7 @@ class NetParser:
         self.data_lock = threading.Lock()
         # Для клиентов – сохраняем DNS запросы с указанием DNS сервера
         self.dns_queries_by_server: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
-        # Для DNS серверов – таблица ответов (NAME, TYPE, RESOLUTION)
+        # Для DNS серверов – сохраняем все ответы (без агрегации на этапе захвата)
         self.dns_response_table: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     @staticmethod
@@ -151,11 +151,10 @@ class NetParser:
         """
         Извлекает DNS записи из пакета.
         Для клиента – сохраняет список DNS запросов с указанием DNS сервера.
-        Для DNS сервера – формирует таблицу ответов (NAME, TYPE, RESOLUTION).
-        При этом трафик mDNS (UDP порт 5353) игнорируется, чтобы не нарушать классификацию.
+        Для DNS сервера – сохраняет все ответы.
+        При этом трафик mDNS (UDP порт 5353) игнорируется.
         """
         try:
-            # Если пакет содержит mDNS (UDP порт 5353), пропускаем его
             if UDP in pkt and (pkt[UDP].sport == 5353 or pkt[UDP].dport == 5353):
                 return
 
@@ -163,7 +162,7 @@ class NetParser:
             if not dns_layer:
                 return
 
-            # Обработка DNS запросов от клиента
+            # DNS запросы от клиента
             if dns_layer.qdcount and dns_layer.qd:
                 queries = dns_layer.qd if isinstance(dns_layer.qd, list) else [dns_layer.qd]
                 ip_src = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
@@ -174,12 +173,10 @@ class NetParser:
                             qname = query.qname.decode() if isinstance(query.qname, bytes) else query.qname
                             self.dns_queries_by_server[ip_src][ip_dst].add(qname)
 
-            # Обработка DNS ответов (для DNS серверов)
+            # DNS ответы от DNS сервера
             if dns_layer.qr == 1 and dns_layer.ancount and dns_layer.an:
                 dns_server_ip = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
                 answers = dns_layer.an if isinstance(dns_layer.an, list) else [dns_layer.an]
-
-                temp_responses: Dict[str, Dict[str, Any]] = {}
                 with self.data_lock:
                     for answer in answers:
                         rrname = (answer.rrname.decode() if isinstance(answer.rrname, bytes)
@@ -187,46 +184,23 @@ class NetParser:
                         rdata = answer.rdata
                         if isinstance(rdata, bytes):
                             rdata = rdata.decode(errors='ignore')
-                        # Если rdata выглядит как IPv4, добавляем ассоциацию
                         if rdata and self._is_valid_ipv4(rdata):
                             self.dns_associations[rdata].add(rrname)
-
                         ans_type = getattr(answer, 'type', 'UNKNOWN')
                         type_str = 'A' if ans_type == 1 else 'CNAME' if ans_type == 5 else str(ans_type)
                         ans_value = rdata if rdata else "<NO_DATA>"
-
-                        if rrname not in temp_responses:
-                            temp_responses[rrname] = {
-                                "name": rrname,
-                                "type": type_str,
-                                "resolution": {ans_value} if type_str == 'A' else ans_value
-                            }
-                        else:
-                            if type_str == 'A' and temp_responses[rrname]["type"] == 'A':
-                                if not isinstance(temp_responses[rrname]["resolution"], set):
-                                    temp_responses[rrname]["resolution"] = {temp_responses[rrname]["resolution"]}
-                                temp_responses[rrname]["resolution"].add(ans_value)
-                            elif type_str != temp_responses[rrname]["type"]:
-                                temp_responses[rrname] = {
-                                    "name": rrname,
-                                    "type": type_str,
-                                    "resolution": {ans_value} if type_str == 'A' else ans_value
-                                }
-                    for entry in temp_responses.values():
-                        if isinstance(entry["resolution"], set):
-                            entry["resolution"] = ", ".join(sorted(entry["resolution"]))
+                        # Сохраняем каждую запись без агрегации
                         self.dns_response_table[dns_server_ip].append({
-                            "name": entry["name"],
-                            "type": entry["type"],
-                            "resolution": entry["resolution"]
+                            "name": rrname,
+                            "type": type_str,
+                            "resolution": ans_value
                         })
         except Exception:
             self.logger.exception("Error handling DNS packet:")
 
     def extract_sni_scapy(self, pcap_file: str) -> None:
         """
-        Извлекает SNI из TLS-пакетов, используя Scapy для чтения pcap файла
-        и ручной разбор TLS ClientHello.
+        Извлекает SNI из TLS-пакетов, используя Scapy для чтения pcap файла.
         """
         try:
             with PcapReader(pcap_file) as reader:
@@ -242,9 +216,6 @@ class NetParser:
             self.logger.exception("Error extracting SNI using Scapy.")
 
     def extract_sni_from_tls(self, data: bytes) -> Optional[str]:
-        """
-        Пытается извлечь SNI из набора TLS записей.
-        """
         pos = 0
         while pos + 5 <= len(data):
             content_type = data[pos]
@@ -252,7 +223,7 @@ class NetParser:
             record_end = pos + 5 + rec_length
             if record_end > len(data):
                 break
-            if content_type != 22:  # Handshake
+            if content_type != 22:
                 pos = record_end
                 continue
             handshake_pos = pos + 5
@@ -262,7 +233,7 @@ class NetParser:
                 handshake_end = handshake_pos + 4 + handshake_length
                 if handshake_end > record_end:
                     break
-                if handshake_type == 1:  # ClientHello
+                if handshake_type == 1:
                     client_hello = data[handshake_pos+4:handshake_end]
                     sni = self._parse_client_hello(client_hello)
                     if sni:
@@ -272,9 +243,6 @@ class NetParser:
         return None
 
     def _parse_client_hello(self, client_hello: bytes) -> Optional[str]:
-        """
-        Разбирает TLS ClientHello и извлекает SNI.
-        """
         pos = 0
         if len(client_hello) < 34:
             return None
@@ -298,14 +266,13 @@ class NetParser:
         if pos + extensions_length > len(client_hello):
             return None
         end_ext = pos + extensions_length
-
         while pos + 4 <= end_ext:
             ext_type = int.from_bytes(client_hello[pos:pos+2], 'big')
             ext_length = int.from_bytes(client_hello[pos+2:pos+4], 'big')
             pos += 4
             if pos + ext_length > end_ext:
                 break
-            if ext_type == 0:  # Server Name extension
+            if ext_type == 0:
                 inner_pos = pos + 2
                 inner_end = pos + ext_length
                 while inner_pos + 3 <= inner_end:
@@ -323,9 +290,6 @@ class NetParser:
 
     def process_packets(self, packets: List[Packet],
                         filters: Optional[Callable[[Packet], bool]] = None) -> None:
-        """
-        Обрабатывает список пакетов: обновляет статистику и парсит данные.
-        """
         for pkt in packets:
             with self.data_lock:
                 self.packet_statistics["total_packets"] += 1
@@ -386,9 +350,6 @@ class NetParser:
     def process_in_parallel(self, pcap_file: str,
                             num_threads: int = 4,
                             filters: Optional[Callable[[Packet], bool]] = None) -> None:
-        """
-        Параллельно обрабатывает пакеты из PCAP файла.
-        """
         def packet_iterator() -> Generator[Packet, None, None]:
             try:
                 with PcapReader(pcap_file) as reader:
@@ -418,9 +379,6 @@ class NetParser:
 
     def analyze(self, pcap_file: str,
                 filters: Optional[Callable[[Packet], bool]] = None) -> Dict[str, Any]:
-        """
-        Основной метод анализа PCAP файла.
-        """
         self.logger.info("[*] Starting PCAP analysis...")
         self.process_in_parallel(pcap_file, filters=filters)
         self.extract_sni_scapy(pcap_file)
@@ -430,8 +388,8 @@ class NetParser:
         """
         Возвращает итоговый словарь с данными по IP.
         Для клиента выводится только таблица "DNS Queries by Server".
-        Для DNS сервера – только таблица "DNS Responses".
-        Остальные данные (ASN, DNS Associations, SNI, HTTP, трафик) собираются как прежде.
+        Для DNS сервера – только таблица "DNS Responses" (без дубликатов, с объединением записей по домену).
+        Дополнительно для клиентов можно восстановить цепочку разрешения (если требуется).
         """
         ip_dns_sni_map: Dict[str, Any] = {}
         with self.data_lock:
@@ -445,11 +403,27 @@ class NetParser:
                 raw_stats = dict(self.output_data.get(ip_norm, {}))
                 dns_queries = self.dns_queries_by_server.get(ip_norm, {})
                 dns_resps = self.dns_response_table.get(ip_norm, [])
-            # Если для IP есть DNS Responses (и более одного запроса не свидетельствует о mDNS),
-            # то считаем его DNS-сервером
-            if dns_resps and len(dns_resps) > 1:
-                dns_info = {"DNS Responses": dns_resps}
-            # Если DNS Responses отсутствуют, а есть DNS Queries – считаем IP клиентом
+            # Если для IP имеются DNS Responses, агрегируем их по (name, type)
+            if dns_resps and len(dns_resps) > 0:
+                aggregated = {}
+                for resp in dns_resps:
+                    key = (resp.get("name"), resp.get("type"))
+                    if key in aggregated:
+                        current = aggregated[key]
+                        new_vals = [x.strip() for x in resp.get("resolution", "").split(",") if x.strip()]
+                        current.update(new_vals)
+                    else:
+                        new_vals = set(x.strip() for x in resp.get("resolution", "").split(",") if x.strip())
+                        aggregated[key] = new_vals
+                aggregated_list = []
+                for (name, type_str), res_set in aggregated.items():
+                    resolution_str = ", ".join(sorted(res_set))
+                    aggregated_list.append({
+                        "name": name,
+                        "type": type_str,
+                        "resolution": resolution_str
+                    })
+                dns_info = {"DNS Responses": aggregated_list}
             elif dns_queries:
                 dns_info = {"DNS Queries by Server": {server_ip: sorted(list(queries))
                                                         for server_ip, queries in dns_queries.items()}}
