@@ -7,9 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Callable, Any, Dict, Set, Generator, List
 import threading
 import os
-from scapy.all import (
-    IP, TCP, UDP, ICMP, DNS, DNSQR, DNSRR, PcapReader, Packet, Raw
-)
+from scapy.all import IP, TCP, UDP, ICMP, DNS, DNSQR, DNSRR, PcapReader, Packet, Raw
 from tqdm import tqdm
 import pyasn
 
@@ -124,6 +122,7 @@ class NetParser:
             return (9999,)
 
     def parse_http_request(self, payload: str) -> Optional[Dict[str, str]]:
+        """Парсит HTTP запрос из полезной нагрузки."""
         lines = payload.splitlines()
         if not lines:
             return None
@@ -151,6 +150,7 @@ class NetParser:
         return http_data
 
     def handle_dns_pkt(self, pkt: Packet) -> None:
+        """Обрабатывает DNS пакет, аккумулируя запросы и ответы."""
         try:
             if UDP in pkt and (pkt[UDP].sport == 5353 or pkt[UDP].dport == 5353):
                 return
@@ -168,25 +168,34 @@ class NetParser:
                     for query in queries:
                         if hasattr(query, 'qname') and query.qname:
                             qname = query.qname.decode() if isinstance(query.qname, bytes) else query.qname
-                            # Удаляем завершающую точку
-                            qname = qname.rstrip('.')
+                            qname = qname.rstrip('.')  # удаляем завершающую точку
                             self.dns_queries_by_server[ip_src][ip_dst].add(qname)
 
             # Обработка DNS ответов
             if dns_layer.qr == 1 and dns_layer.ancount and dns_layer.an:
-                dns_server_ip = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
+                ip_src = pkt[IP].src if IP in pkt else '<UNKNOWN>'
+                dns_server_ip = self._normalize_ipv4(ip_src)
                 answers = dns_layer.an if isinstance(dns_layer.an, list) else [dns_layer.an]
                 with self.data_lock:
                     for answer in answers:
-                        rrname = (answer.rrname.decode() if isinstance(answer.rrname, bytes)
-                                  else answer.rrname) if answer.rrname else '<UNKNOWN>'
+                        try:
+                            rrname = (answer.rrname.decode() if isinstance(answer.rrname, bytes)
+                                      else answer.rrname) if answer.rrname else '<UNKNOWN>'
+                        except Exception:
+                            rrname = '<UNKNOWN>'
                         rrname = rrname.rstrip('.')
-                        rdata = answer.rdata
+                        try:
+                            rdata = answer.rdata
+                        except AttributeError:
+                            rdata = None
                         if isinstance(rdata, bytes):
                             rdata = rdata.decode(errors='ignore')
                         if rdata and self._is_valid_ipv4(rdata):
                             self.dns_associations[rdata].add(rrname)
-                        ans_type = getattr(answer, 'type', 'UNKNOWN')
+                        try:
+                            ans_type = getattr(answer, 'type', 'UNKNOWN')
+                        except Exception:
+                            ans_type = 'UNKNOWN'
                         type_str = DNS_TYPE_MAP.get(ans_type, str(ans_type))
                         ans_value = rdata if rdata else "<NO_DATA>"
                         if type_str != "A" and isinstance(ans_value, str):
@@ -200,6 +209,7 @@ class NetParser:
             self.logger.exception("Error handling DNS packet:")
 
     def extract_sni_scapy(self, pcap_file: str) -> None:
+        """Извлекает SNI из TLS-пакетов."""
         try:
             with PcapReader(pcap_file) as reader:
                 for pkt in reader:
@@ -386,8 +396,7 @@ class NetParser:
         """
         Формирует итоговый словарь с данными по IP.
         Для клиента выводится только таблица "DNS Queries by Server".
-        Для DNS сервера – только таблица "DNS Responses" (без дубликатов, с объединением записей по домену).
-        Дополнительно можно добавить восстановление цепочек разрешения.
+        Для DNS сервера – таблица "DNS Responses" (без дубликатов, с объединением записей по домену).
         """
         ip_dns_sni_map: Dict[str, Any] = {}
         with self.data_lock:
@@ -401,15 +410,13 @@ class NetParser:
                 raw_stats = dict(self.output_data.get(ip_norm, {}))
                 dns_queries = self.dns_queries_by_server.get(ip_norm, {})
                 dns_resps = self.dns_response_table.get(ip_norm, [])
-            # Агрегируем DNS ответы по (name, type) и удаляем завершающие точки
             if dns_resps and len(dns_resps) > 0:
                 aggregated = {}
                 for resp in dns_resps:
                     name = resp.get("name", "").rstrip('.')
                     type_str = resp.get("type", "")
-                    # Для A-записей объединяем все IP-адреса; для остальных удаляем завершающую точку
                     resolution = resp.get("resolution", "")
-                    if type_str != "A":
+                    if type_str != "A" and isinstance(resolution, str):
                         resolution = resolution.rstrip('.')
                     key = (name, type_str)
                     if key in aggregated:
@@ -429,18 +436,14 @@ class NetParser:
                     })
                 dns_info = {"DNS Responses": aggregated_list}
             elif dns_queries:
-                # Удаляем завершающие точки из ключей и запросов
                 dns_info = {"DNS Queries by Server": {
                     server_ip.rstrip('.'): sorted([q.rstrip('.') for q in queries])
                     for server_ip, queries in dns_queries.items()
                 }}
             else:
                 dns_info = {}
-            # Здесь можно добавить восстановление цепочек разрешения, если нужно.
-            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"]
-                             if k in raw_stats}
-            protocol_stats = {k: v for k, v in raw_stats.items()
-                              if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
+            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"] if k in raw_stats}
+            protocol_stats = {k: v for k, v in raw_stats.items() if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
             with self.data_lock:
                 http_reqs = self.http_requests.get(ip_norm, [])
             unique_reqs = {}
