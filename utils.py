@@ -5,13 +5,11 @@ from typing import Any, Dict, List
 from jinja2 import Template
 from netparser import NetParser
 
-
 def ip_sort_key(ip: str) -> tuple:
     try:
         return tuple(int(part) for part in ip.split('.'))
     except Exception:
         return (9999,)
-
 
 def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any]:
     base_parser = NetParser()
@@ -77,13 +75,11 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
         unique_traffic["Overall Packet Statistics"] = plugin_traffic.get("Overall Packet Statistics", {})
     return unique_traffic
 
-
 def generate_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     print(f"[*] Report saved to '{output_path}'")
     return data
-
 
 def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
@@ -253,17 +249,15 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, An
     print(f"[*] HTML Report saved to '{output_path}'")
     return data
 
-
 def print_report(report_data: Dict[str, Any]) -> None:
     """
-    Выводит анализ трафика на экран с таблицами для DNS Queries by Server или DNS Responses.
+    Выводит анализ трафика на экран в консоль с таблицами для DNS Queries или агрегированными DNS Responses.
     """
     def ip_sort_key_inner(ip: str) -> tuple:
         try:
             return tuple(int(part) for part in ip.split('.'))
         except Exception:
             return (9999,)
-
     print("\n" + "=" * 60)
     print(f"{'Network Traffic Analysis Report':^60}")
     print("=" * 60)
@@ -327,3 +321,23 @@ def print_report(report_data: Dict[str, Any]) -> None:
         else:
             print("\nHTTP Requests: None")
         print("=" * 60)
+        
+
+def generate_txt_report(output_path: str, data: Dict[str, Any]) -> None:
+    with open(output_path, "w", encoding="utf-8") as f:
+        for ip, info in data.items():
+            if ip == "Overall Packet Statistics":
+                continue
+            f.write(f"{ip}\n")
+            dns_assocs = info.get("DNS Associations", [])
+            sni_records = info.get("SNI Records", [])
+            if dns_assocs:
+                f.write("DNS Associations: ")
+                for assoc in dns_assocs:
+                    f.write(f"{assoc}\n")
+            if sni_records:
+                f.write("SNI Records: ")
+                for record in sni_records:
+                    f.write(f"{record}\n")
+            f.write("\n")
+    print(f"[*] TXT Report saved to '{output_path}'")
