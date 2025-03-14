@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
-from utils import compare_traffic, generate_report, generate_html_report, print_report
+from utils import compare_traffic, generate_report, generate_html_report, print_report, generate_txt_report
 from netparser import NetParser
 
 
@@ -15,10 +15,10 @@ def main() -> None:
     parser.add_argument("--html", metavar="HTML_PATH", help="Generate HTML report at specified path")
     parser.add_argument("--json", metavar="JSON_PATH", help="Generate JSON report at specified path")
     parser.add_argument("--compare", metavar="COMPARE_FILE", help="Path to the second PCAP file for comparison")
+    parser.add_argument("--txt", metavar="TXT_PATH", help="Generate TXT report at specified path")
     args = parser.parse_args()
 
     try:
-        # Если задан флаг сравнения, проводим сравнение трафика двух файлов.
         if args.compare:
             unique_traffic = compare_traffic(args.pcap_file, args.compare)
             print_report(unique_traffic)
@@ -29,7 +29,6 @@ def main() -> None:
         else:
             filters = None
             if args.filter:
-                # Поддержка нескольких фильтров через запятую (сравнение без учета регистра)
                 filter_terms = [term.strip() for term in args.filter.upper().split(",")]
                 filters = lambda pkt: any(term in str(pkt).upper() for term in filter_terms)
 
@@ -42,8 +41,9 @@ def main() -> None:
                 generate_report(args.json, report_data)
             if args.html:
                 generate_html_report(args.html, report_data)
+            if args.txt:
+                generate_txt_report(args.txt, report_data)
     except Exception:
-        # Если возникла ошибка, выводим сообщение и завершаем выполнение.
         sys.exit("An error occurred during processing. Please check error.log for details.")
 
 
