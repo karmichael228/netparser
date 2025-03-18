@@ -123,13 +123,16 @@ python3 main.py your_pcap_file.pcap --check-blacklists
 - Информацию о наличии IP в черных списках
 
 IP: 1.2.3.4
+
 DNS Associations:
   - example.com
+
 SNI Records:
   - example.com
 
 ### Консольный вывод
 === Общая статистика пакетов ===
+
 [таблица со статистикой]
 
 === Статистика по IP ===
