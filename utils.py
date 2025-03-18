@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple, Optional, Set
 from jinja2 import Template
-from netparser import NetParser
+from netparser import NetParser, IpsumBlacklist
+from tabulate import tabulate
+from termcolor import colored
+import datetime
 
 def ip_sort_key(ip: str) -> tuple:
     try:
@@ -19,6 +22,8 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
     plugin_parser.analyze(pcap_plugin_file)
     plugin_traffic = plugin_parser.get_dict()
 
+    ip_blacklist = IpsumBlacklist()
+
     unique_traffic: Dict[str, Any] = {}
     ip_pattern = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
     for ip, plugin_data in plugin_traffic.items():
@@ -27,8 +32,18 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
         if not ip_pattern.match(ip):
             continue
         base_data = base_traffic.get(ip)
+        
+        is_blacklisted, threat_score = ip_blacklist.check_ip(ip)
+        
         if not base_data:
             unique_traffic[ip] = plugin_data
+            if "Threat Info" not in plugin_data and is_blacklisted:
+                threat_info = {
+                    "is_blacklisted": is_blacklisted,
+                    "threat_score": threat_score,
+                    "threat_level": ip_blacklist.get_threat_level(threat_score)
+                }
+                plugin_data["Threat Info"] = threat_info
         else:
             unique_dns = set(plugin_data["DNS Associations"]) - set(base_data["DNS Associations"])
             unique_sni = set(plugin_data["SNI Records"]) - set(base_data["SNI Records"])
@@ -51,6 +66,15 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 unique_queries = plugin_server_queries - base_server_queries
                 if unique_queries:
                     unique_dns_queries_by_server[server_ip] = sorted(unique_queries)
+            
+            threat_info = None
+            if is_blacklisted:
+                threat_info = {
+                    "is_blacklisted": is_blacklisted,
+                    "threat_score": threat_score,
+                    "threat_level": ip_blacklist.get_threat_level(threat_score)
+                }
+            
             unique_traffic[ip] = {
                 "ASN": unique_asn if unique_asn else base_data["ASN"],
                 "DNS Associations": sorted(unique_dns),
@@ -64,6 +88,10 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                             for key in set(plugin_data["Traffic"]) | set(base_data["Traffic"])},
                 "Protocols": {key: count for key, count in unique_packets.items() if count != 0}
             }
+            
+            # Добавляем информацию о угрозе, если IP в черном списке
+            if threat_info:
+                unique_traffic[ip]["Threat Info"] = threat_info
 
     if "Overall Packet Statistics" in base_traffic and "Overall Packet Statistics" in plugin_traffic:
         overall_base = base_traffic["Overall Packet Statistics"]
@@ -81,263 +109,656 @@ def generate_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
     print(f"[*] Report saved to '{output_path}'")
     return data
 
-def generate_html_report(output_path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
+    """
+    Генерирует HTML-отчет об анализе сетевого трафика.
+    
+    Args:
+        output_path: Путь к файлу отчета
+        data: Словарь с данными отчета
+    """
+    
     ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
     sorted_ips = sorted(ip_keys, key=ip_sort_key)
-    html_template = """
+    
+    template_str = """
     <!DOCTYPE html>
-    <html>
+    <html lang="ru">
     <head>
-        <meta charset="utf-8">
-        <title>Network Traffic Analysis Report</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Отчет по анализу сетевого трафика</title>
         <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; padding: 0; }
-            .header { background: linear-gradient(90deg, #4b79a1, #283e51); color: white; padding: 20px; text-align: center; }
-            .container { width: 90%; margin: 20px auto; }
-            .section { background: white; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; padding: 20px; }
-            .section h2 { border-bottom: 2px solid #4b79a1; padding-bottom: 10px; margin-bottom: 20px; color: #283e51; }
-            .ip-card { border: 1px solid #ddd; border-radius: 6px; margin-bottom: 20px; padding: 15px; background-color: #fafafa; }
-            .ip-card h3 { margin-top: 0; color: #4b79a1; }
-            .data-list { list-style: none; padding: 0; }
-            .data-list li { padding: 5px 0; border-bottom: 1px solid #eee; }
-            .data-list li:last-child { border-bottom: none; }
-            .link-list a { display: block; padding: 5px; text-decoration: none; color: #4b79a1; border: 1px solid #4b79a1; border-radius: 4px; margin-bottom: 5px; transition: background 0.3s, color 0.3s; }
-            .link-list a:hover { background: #4b79a1; color: white; }
-            .overall-stats { display: flex; flex-wrap: wrap; }
-            .stat-item { flex: 1 0 200px; margin: 10px; background: white; padding: 15px; border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); text-align: center; }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-            table, th, td { border: 1px solid #ddd; }
-            th, td { padding: 8px; text-align: left; }
-            th { background-color: #4b79a1; color: white; }
+            body {
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+                color: #333;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: #fff;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1, h2, h3 {
+                color: #2c3e50;
+            }
+            h1 {
+                text-align: center;
+                border-bottom: 2px solid #eee;
+                padding-bottom: 10px;
+                margin-bottom: 20px;
+            }
+            .stats-container, .ip-container {
+                margin-bottom: 20px;
+                padding: 15px;
+                background-color: #f9f9f9;
+                border-radius: 5px;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 20px;
+            }
+            th, td {
+                padding: 12px 15px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }
+            th {
+                background-color: #f2f2f2;
+                font-weight: bold;
+            }
+            tr:hover {
+                background-color: #f5f5f5;
+            }
+            .section-title {
+                margin-top: 20px;
+                padding-bottom: 5px;
+                border-bottom: 1px solid #eee;
+            }
+            .dns-response {
+                margin-bottom: 10px;
+                padding: 8px;
+                background-color: #f2f2f2;
+                border-radius: 4px;
+            }
+            .dns-response-name {
+                font-weight: bold;
+            }
+            .header-info {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+            }
+            .timestamp {
+                color: #777;
+                font-size: 0.9em;
+            }
+            .threat-ip {
+                color: #e74c3c;
+                font-weight: bold;
+            }
+            .safe-ip {
+                color: #2ecc71;
+                font-weight: bold;
+            }
+            .threat-badge {
+                display: inline-block;
+                padding: 3px 6px;
+                border-radius: 3px;
+                font-size: 0.8em;
+                font-weight: bold;
+                color: white;
+                margin-left: 5px;
+            }
+            .threat-low {
+                background-color: #f39c12;
+            }
+            .threat-medium {
+                background-color: #e67e22;
+            }
+            .threat-high {
+                background-color: #d35400;
+            }
+            .threat-critical {
+                background-color: #c0392b;
+            }
+            .collapsible {
+                background-color: #f9f9f9;
+                color: #444;
+                cursor: pointer;
+                padding: 18px;
+                width: 100%;
+                border: none;
+                text-align: left;
+                outline: none;
+                font-size: 15px;
+                border-radius: 5px;
+                margin-top: 5px;
+                transition: background-color 0.3s;
+            }
+            .active, .collapsible:hover {
+                background-color: #eee;
+            }
+            .content {
+                padding: 0 18px;
+                max-height: 0;
+                overflow: hidden;
+                transition: max-height 0.2s ease-out;
+                background-color: white;
+                border-radius: 0 0 5px 5px;
+            }
+            .toggle-icon {
+                float: right;
+                margin-left: 5px;
+            }
+            .section-collapsible {
+                background-color: #2c3e50;
+                color: white;
+                cursor: pointer;
+                padding: 18px;
+                width: 100%;
+                border: none;
+                text-align: left;
+                outline: none;
+                font-size: 18px;
+                border-radius: 5px;
+                margin: 10px 0;
+                transition: background-color 0.3s;
+            }
+            .section-collapsible:hover {
+                background-color: #34495e;
+            }
+            .ip-collapsible {
+                background-color: #2ecc71;
+                color: white;
+                cursor: pointer;
+                padding: 15px;
+                width: 100%;
+                border: none;
+                text-align: left;
+                outline: none;
+                font-size: 16px;
+                border-radius: 5px;
+                margin: 5px 0;
+                transition: background-color 0.3s;
+            }
+            .ip-collapsible.blacklisted {
+                background-color: #e74c3c;
+            }
+            .ip-collapsible:hover {
+                background-color: #27ae60;
+            }
+            .ip-collapsible.blacklisted:hover {
+                background-color: #c0392b;
+            }
+            .ip-content {
+                padding: 0 18px;
+                max-height: 0;
+                overflow: hidden;
+                transition: max-height 0.2s ease-out;
+                background-color: white;
+                border-radius: 0 0 5px 5px;
+                border: 1px solid #ddd;
+                border-top: none;
+            }
+            .chart-container {
+                position: relative;
+                margin: auto;
+                height: 300px;
+                width: 100%;
+            }
+            a {
+                color: #3498db;
+                text-decoration: none;
+            }
+            a:hover {
+                text-decoration: underline;
+            }
+            .uri-link {
+                margin-bottom: 5px;
+                display: inline-block;
+            }
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>Network Traffic Analysis Report</h1>
-        </div>
         <div class="container">
-            {% if data.get("Overall Packet Statistics") %}
-            <div class="section">
-                <h2>Overall Packet Statistics</h2>
-                <div class="overall-stats">
-                    {% for stat, value in data["Overall Packet Statistics"].items() %}
-                    <div class="stat-item">
-                        <h3>{{ stat }}</h3>
-                        <p>{{ value }}</p>
-                    </div>
-                    {% endfor %}
-                </div>
+            <div class="header-info">
+                <h1>Отчет по анализу сетевого трафика</h1>
+                <span class="timestamp">Сгенерирован: {{ timestamp }}</span>
             </div>
-            {% endif %}
-            {% for ip in sorted_ips %}
-                {% set report = data[ip] %}
-                <div class="ip-card">
-                    <h3>IP: {{ ip }}</h3>
-                    <ul class="data-list">
-                        <li><strong>ASN:</strong> {{ report['ASN'] }}</li>
-                        <li><strong>DNS Associations:</strong> {{ report['DNS Associations'] | join(', ') if report['DNS Associations'] else 'None' }}</li>
-                    </ul>
-                    {% if report['DNS Queries by Server'] and report['DNS Queries by Server']|length > 0 %}
-                    <div class="section">
-                        <h2>DNS Queries by Server</h2>
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>DNS Server</th>
-                                    <th>Queries</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for server_ip, queries in report['DNS Queries by Server'].items() %}
-                                <tr>
-                                    <td>{{ server_ip }}</td>
-                                    <td>{{ queries | join(', ') }}</td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
+            
+            <!-- Общая статистика по пакетам (раскрывающийся блок) -->
+            <button class="section-collapsible" onclick="toggleSection('statsSection')">
+                Общая статистика по пакетам <span class="toggle-icon">+</span>
+            </button>
+            <div id="statsSection" class="content">
+                {% if stats %}
+                <div class="stats-container">
+                    <table>
+                        <tr>
+                            <th>Метрика</th>
+                            <th>Значение</th>
+                        </tr>
+                        {% for stat, value in stats.items() %}
+                        <tr>
+                            <td>{{ stat }}</td>
+                            <td>{{ value }}</td>
+                        </tr>
+                        {% endfor %}
+                    </table>
+                </div>
+                {% else %}
+                <p>Нет доступной статистики.</p>
+                {% endif %}
+            </div>
+            
+            <!-- IP адреса (раскрывающийся блок) -->
+            <button class="section-collapsible" onclick="toggleSection('ipSection')">
+                IP адреса ({{ sorted_ips|length }}) <span class="toggle-icon">+</span>
+            </button>
+            <div id="ipSection" class="content">
+                {% for ip in sorted_ips %}
+                {% set ip_data = data[ip] %}
+                {% set is_blacklisted, threat_level, threat_score = get_threat_info_for_ip(ip, data) %}
+                
+                <button class="ip-collapsible {% if is_blacklisted %}blacklisted{% endif %}" onclick="toggleIP('ip_{{ ip|replace('.', '_') }}')">
+                    {% if is_blacklisted %}
+                        {{ ip }} - В черном списке ({{ threat_level }}: {{ threat_score }})
+                    {% else %}
+                        {{ ip }} - {{ ip_data.get('ASN', 'Не доступно') }}
+                    {% endif %}
+                    <span class="toggle-icon">+</span>
+                </button>
+                <div id="ip_{{ ip|replace('.', '_') }}" class="ip-content">
+                    <!-- Информация об угрозе -->
+                    <div class="section-title">
+                        <h3>Информация об угрозе</h3>
+                        {% if is_blacklisted %}
+                            <p class="threat-ip">Статус: В черном списке - {{ threat_level }} ({{ threat_score }})</p>
+                        {% else %}
+                            <p class="safe-ip">Статус: Отсуствует в черном спсике </p>
+                        {% endif %}
                     </div>
-                    {% elif report['DNS Responses'] and report['DNS Responses']|length > 0 %}
-                    <div class="section">
-                        <h2>DNS Responses</h2>
-                        <table>
-                            <thead>
+                    
+                    <!-- ASN -->
+                    <div class="section-title">
+                        <h3>ASN</h3>
+                        <p>{{ ip_data.get('ASN', 'Не доступно') }}</p>
+                    </div>
+                    
+                    <!-- DNS ассоциации -->
+                    {% if ip_data.get('DNS Associations') %}
+                    <div class="section-title">
+                        <h3>DNS-ассоциации</h3>
+                        <ul>
+                        {% for assoc in ip_data.get('DNS Associations', []) %}
+                            <li>{{ assoc }}</li>
+                        {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- DNS запросы по серверам -->
+                    {% if ip_data.get('DNS Queries by Server') %}
+                    <div class="section-title">
+                        <h3>DNS-запросы по серверу</h3>
+                        {% for server, queries in ip_data.get('DNS Queries by Server', {}).items() %}
+                            <button class="collapsible">
+                                {% set is_server_blacklisted, server_threat_level, server_threat_score = get_threat_info_for_ip(server, data) %}
+                                {% if is_server_blacklisted %}
+                                    <span class="threat-ip">Сервер {{ server }}</span>
+                                    <span class="threat-badge {{ get_threat_badge_class(server_threat_level) }}">
+                                        {{ server_threat_score }}
+                                    </span>
+                                {% else %}
+                                    <span class="safe-ip">Сервер {{ server }}</span>
+                                {% endif %}
+                                <span class="toggle-icon">+</span>
+                            </button>
+                            <div class="content">
+                                <ul>
+                                {% for query in queries %}
+                                    <li>{{ query }}</li>
+                                {% endfor %}
+                                </ul>
+                            </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+                    
+                    <!-- DNS ответы (раскрывающийся блок) -->
+                    {% if ip_data.get('DNS Responses') %}
+                    <div class="section-title">
+                        <h3>DNS-ответы</h3>
+                        <button class="collapsible">Показать/скрыть DNS-ответы ({{ ip_data.get('DNS Responses')|length }}) <span class="toggle-icon">+</span></button>
+                        <div class="content">
+                            <table>
                                 <tr>
-                                    <th>NAME</th>
-                                    <th>TYPE</th>
-                                    <th>RESOLUTION</th>
+                                    <th>Имя</th>
+                                    <th>Тип</th>
+                                    <th>Разрешение</th>
                                 </tr>
-                            </thead>
-                            <tbody>
-                                {% for entry in report['DNS Responses'] %}
+                                {% for entry in ip_data.get('DNS Responses', []) %}
                                 <tr>
                                     <td>{{ entry.name }}</td>
                                     <td>{{ entry.type }}</td>
-                                    <td>{{ entry.resolution }}</td>
+                                    <td>
+                                        {% if entry.type == "A" %}
+                                            {% set ips = entry.resolution.split(',') %}
+                                            {% for resolved_ip in ips %}
+                                                {% set resolved_ip = resolved_ip.strip() %}
+                                                {% set is_ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(resolved_ip, data) %}
+                                                {% if is_ip_blacklisted %}
+                                                    <span class="threat-ip">{{ resolved_ip }}</span>
+                                                    <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
+                                                        {{ ip_threat_score }}
+                                                    </span>
+                                                {% else %}
+                                                    <span class="safe-ip">{{ resolved_ip }}</span>
+                                                {% endif %}
+                                                {% if not loop.last %}, {% endif %}
+                                            {% endfor %}
+                                        {% else %}
+                                            {{ entry.resolution }}
+                                        {% endif %}
+                                    </td>
                                 </tr>
                                 {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                    {% endif %}
-                    {% if report.get("DNS Resolution Chains") %}
-                    <div class="section">
-                        <h2>DNS Resolution Chains</h2>
-                        <ul class="data-list">
-                            {% for chain in report["DNS Resolution Chains"] %}
-                            <li>{{ chain }}</li>
-                            {% endfor %}
-                        </ul>
-                    </div>
-                    {% endif %}
-                    <ul class="data-list">
-                        <li><strong>HTTP Domains:</strong> {{ report["HTTP Domains"] | join(', ') if report["HTTP Domains"] else "None" }}</li>
-                        <li><strong>SNI Records:</strong> {{ report["SNI Records"] | join(', ') if report["SNI Records"] else "None" }}</li>
-                    </ul>
-                    <div class="section">
-                        <h2>Traffic (Packets/Bytes)</h2>
-                        <ul class="data-list">
-                            {% for key, value in report["Traffic"].items() %}
-                            <li><strong>{{ key.replace('_', ' ').title() }}:</strong> {{ value }}</li>
-                            {% endfor %}
-                        </ul>
-                    </div>
-                    <div class="section">
-                        <h2>Protocols</h2>
-                        <ul class="data-list">
-                            {% for key, value in report["Protocols"].items() %}
-                            <li><strong>{{ key.replace('_', ' ').title() }}:</strong> {{ value }}</li>
-                            {% endfor %}
-                        </ul>
-                    </div>
-                    {% if report["HTTP Requests"] and report["HTTP Requests"]|length > 0 %}
-                    <div class="section">
-                        <h2>HTTP Requests</h2>
-                        <ul class="data-list">
-                            {% for req in report["HTTP Requests"] %}
-                            <li>
-                                <strong>Method:</strong> {{ req.method }},
-                                <strong>URI:</strong> {{ req.uri }},
-                                <strong>Version:</strong> {{ req.version }}<br>
-                                <strong>Host:</strong> {{ req.host }}{% if req.user_agent %}, <strong>User-Agent:</strong> {{ req.user_agent }}{% endif %}
-                            </li>
-                            {% endfor %}
-                        </ul>
-                    </div>
-                    <div class="section">
-                        <h2>HTTP URI Links</h2>
-                        <div class="link-list">
-                            {% for req in report["HTTP Requests"] %}
-                                {% if req.host and req.uri %}
-                                    {% set url = "http://" + req.host + req.uri %}
-                                    <a href="{{ url }}" target="_blank">{{ url }}</a>
-                                {% endif %}
-                            {% endfor %}
+                            </table>
                         </div>
                     </div>
                     {% endif %}
+                    
+                    <!-- SNI записи -->
+                    {% if ip_data.get('SNI Records') %}
+                    <div class="section-title">
+                        <h3>SNI-записи</h3>
+                        <ul>
+                        {% for record in ip_data.get('SNI Records', []) %}
+                            <li>{{ record }}</li>
+                        {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- HTTP домены -->
+                    {% if ip_data.get('HTTP Domains') %}
+                    <div class="section-title">
+                        <h3>HTTP-домены</h3>
+                        <ul>
+                        {% for domain in ip_data.get('HTTP Domains', []) %}
+                            <li>{{ domain }}</li>
+                        {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- Трафик -->
+                    {% if ip_data.get('Traffic') %}
+                    <div class="section-title">
+                        <h3>Трафик</h3>
+                        <table>
+                            <tr>
+                                <th>Тип</th>
+                                <th>Размер</th>
+                            </tr>
+                            {% for traffic_type, size in ip_data.get('Traffic', {}).items() %}
+                            <tr>
+                                <td>{{ traffic_type.replace('_', ' ').title() }}</td>
+                                <td>{{ size }}</td>
+                            </tr>
+                            {% endfor %}
+                        </table>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- Протоколы -->
+                    {% if ip_data.get('Protocols') %}
+                    <div class="section-title">
+                        <h3>Протоколы</h3>
+                        <table>
+                            <tr>
+                                <th>Протокол</th>
+                                <th>Количество</th>
+                            </tr>
+                            {% for protocol, count in ip_data.get('Protocols', {}).items() %}
+                            <tr>
+                                <td>{{ protocol }}</td>
+                                <td>{{ count }}</td>
+                            </tr>
+                            {% endfor %}
+                        </table>
+                    </div>
+                    {% endif %}
+                    
+                    <!-- HTTP запросы и ссылки -->
+                    {% if ip_data.get('HTTP Requests') %}
+                    <div class="section-title">
+                        <h3>HTTP-запросы</h3>
+                        {% for req in ip_data.get('HTTP Requests', []) %}
+                        <div class="dns-response">
+                            <div><strong>{{ req.get('method', '') }} {{ req.get('uri', '') }} {{ req.get('version', '') }}</strong></div>
+                            <div>Host: {{ req.get('host', '') }}</div>
+                            {% if req.get('user_agent') %}
+                            <div>User-Agent: {{ req.get('user_agent', '') }}</div>
+                            {% endif %}
+                            {% if req.get('host') and req.get('uri') %}
+                            <div class="uri-link">
+                                <a href="http://{{ req.get('host') }}{{ req.get('uri') }}" target="_blank">http://{{ req.get('host') }}{{ req.get('uri') }}</a>
+                            </div>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
                 </div>
-            {% endfor %}
+                {% endfor %}
+            </div>
         </div>
+        
+        <script>
+            // Функция для переключения раскрывающихся секций
+            function toggleSection(sectionId) {
+                var content = document.getElementById(sectionId);
+                var button = content.previousElementSibling;
+                var icon = button.querySelector(".toggle-icon");
+                
+                if (content.style.maxHeight) {
+                    content.style.maxHeight = null;
+                    icon.textContent = "+";
+                } else {
+                    content.style.maxHeight = "none";
+                    icon.textContent = "-";
+                }
+            }
+            
+            // Функция для переключения IP-информации
+            function toggleIP(ipId) {
+                var content = document.getElementById(ipId);
+                var button = content.previousElementSibling;
+                var icon = button.querySelector(".toggle-icon");
+                
+                if (content.style.maxHeight) {
+                    content.style.maxHeight = null;
+                    icon.textContent = "+";
+                } else {
+                    content.style.maxHeight = "none";
+                    icon.textContent = "-";
+                }
+            }
+            
+            // Обработчик для всех обычных коллапсов
+            var coll = document.getElementsByClassName("collapsible");
+            for (var i = 0; i < coll.length; i++) {
+                coll[i].addEventListener("click", function() {
+                    this.classList.toggle("active");
+                    var content = this.nextElementSibling;
+                    var icon = this.querySelector(".toggle-icon");
+                    
+                    if (content.style.maxHeight) {
+                        content.style.maxHeight = null;
+                        if (icon) icon.textContent = "+";
+                    } else {
+                        content.style.maxHeight = content.scrollHeight + "px";
+                        if (icon) icon.textContent = "-";
+                    }
+                });
+            }
+            
+            // Автоматически открыть первую секцию при загрузке
+            document.addEventListener("DOMContentLoaded", function() {
+                toggleSection('statsSection');
+            });
+        </script>
     </body>
     </html>
     """
-    template = Template(html_template)
-    html_content = template.render(data=data, sorted_ips=sorted_ips)
+    
+    template = Template(template_str)
+    
+    context = {
+        'data': data,
+        'stats': data.get('Overall Packet Statistics', {}),
+        'sorted_ips': sorted_ips,
+        'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'get_threat_info_for_ip': get_threat_info_for_ip,
+        'get_threat_badge_class': get_threat_badge_class
+    }
+    
+    html_content = template.render(**context)
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(html_content)
+    
     print(f"[*] HTML Report saved to '{output_path}'")
-    return data
 
 def print_report(report_data: Dict[str, Any]) -> None:
     """
-    Выводит анализ трафика на экран в консоль с таблицами для DNS Queries или агрегированными DNS Responses.
+    Выводит отчет об анализе сетевого трафика в консоль.
+    
+    Args:
+        report_data: Словарь с данными отчета
     """
-    def ip_sort_key_inner(ip: str) -> tuple:
-        try:
-            return tuple(int(part) for part in ip.split('.'))
-        except Exception:
-            return (9999,)
-    print("\n" + "=" * 60)
-    print(f"{'Network Traffic Analysis Report':^60}")
-    print("=" * 60)
-    overall_stats = report_data.get("Overall Packet Statistics")
-    if overall_stats:
-        print(f"\n{'Overall Packet Statistics':^60}")
-        print("-" * 60)
-        for stat, value in overall_stats.items():
-            print(f"{stat:<20}: {value}")
-        print("=" * 60)
+    if "Overall Packet Statistics" in report_data:
+        print("\n=== Общая статистика пакетов ===")
+        stats_table = [[k, v] for k, v in report_data["Overall Packet Statistics"].items()]
+        print(tabulate(stats_table, headers=["Метрика", "Значение"], tablefmt="pretty"))
+    
     ip_keys = [ip for ip in report_data.keys() if ip != "Overall Packet Statistics"]
-    sorted_ips = sorted(ip_keys, key=ip_sort_key_inner)
-    for ip in sorted_ips:
-        report = report_data[ip]
-        print(f"\n{'IP Address:':<15}{ip}")
-        print(f"{'ASN:':<15}{report.get('ASN', 'Not Available')}")
-        dns_info = ', '.join(report.get('DNS Associations', [])) if report.get('DNS Associations') else 'None'
-        print(f"{'DNS Associations:':<15}{dns_info}")
-        if report.get('DNS Queries by Server'):
-            print(f"{'DNS Queries by Server:':<15}")
-            print("  +----------------+-----------------+")
-            print("  | DNS Server     | Queries         |")
-            print("  +----------------+-----------------+")
-            for server_ip, queries in report['DNS Queries by Server'].items():
-                queries_str = ', '.join(queries)
-                print(f"  | {server_ip:<14} | {queries_str:<15} |")
-            print("  +----------------+-----------------+")
-        elif report.get('DNS Responses'):
-            print(f"{'DNS Responses:':<15}")
-            print("  +-----------------+-------+-----------------+")
-            print("  | NAME            | TYPE  | RESOLUTION      |")
-            print("  +-----------------+-------+-----------------+")
-            for entry in report['DNS Responses']:
-                print(f"  | {entry['name']:<15} | {entry['type']:<5} | {entry['resolution']:<15} |")
-            print("  +-----------------+-------+-----------------+")
-        if report.get("DNS Resolution Chains"):
-            print(f"{'DNS Resolution Chains:':<15}")
-            for chain in report["DNS Resolution Chains"]:
-                print(f"  {chain}")
-        print(f"{'HTTP Domains:':<15}{', '.join(report.get('HTTP Domains', [])) if report.get('HTTP Domains') else 'None'}")
-        print(f"{'SNI Records:':<15}{', '.join(report.get('SNI Records', [])) if report.get('SNI Records') else 'None'}")
-        print("\nTraffic (Packets/Bytes):")
-        for key, value in report.get('Traffic', {}).items():
-            print(f"  {key.replace('_', ' ').title():<20}{value}")
-        print("\nProtocols:")
-        for key, value in report.get('Protocols', {}).items():
-            print(f"  {key.replace('_', ' ').title():<20}{value}")
-        http_reqs = report.get('HTTP Requests', [])
-        if http_reqs:
-            print("\nHTTP Requests:")
-            for req in http_reqs:
-                req_line = f"{req.get('method', '')} {req.get('uri', '')} {req.get('version', '')} | Host: {req.get('host', '')}"
-                if req.get('user_agent'):
-                    req_line += f" | User-Agent: {req.get('user_agent', '')}"
-                print(f"  {req_line}")
-            print("\nHTTP URI Links:")
-            for req in http_reqs:
-                if req.get('host') and req.get('uri'):
-                    url = "http://" + req.get('host') + req.get('uri')
-                    print(f"  {url}")
-        else:
-            print("\nHTTP Requests: None")
-        print("=" * 60)
+    total_ips = len(ip_keys)
+    blacklisted_ips = sum(1 for ip in ip_keys if get_threat_info_for_ip(ip, report_data)[0])
+    
+    print("\n=== Статистика по IP ===")
+    print(f"Всего IP: {total_ips}")
+    print(f"IP в черном списке: {blacklisted_ips}")
+
+def get_threat_info_for_ip(ip: str, data: Dict[str, Any]) -> Tuple[bool, str, int]:
+    """
+    Получает информацию о угрозе для IP-адреса.
+    
+    Args:
+        ip: IP-адрес для проверки
+        data: Словарь с данными отчета
         
+    Returns:
+        Tuple[bool, str, int]: (есть_в_черном_списке, уровень_угрозы, счетчик_угрозы)
+    """
+    if not ip or not data.get(ip) or not data[ip].get('Threat Info'):
+        return False, "", 0
+    
+    threat_info = data[ip]['Threat Info']
+    is_blacklisted = threat_info.get('is_blacklisted', False)
+    threat_level = threat_info.get('threat_level', 'Unknown')
+    threat_score = threat_info.get('threat_score', 0)
+    
+    return is_blacklisted, threat_level, threat_score
+
+def get_threat_badge_class(threat_level: str) -> str:
+    """
+    Возвращает CSS-класс для бейджа угрозы.
+    
+    Args:
+        threat_level: Уровень угрозы (Низкий, Средний, Высокий, Критический)
+        
+    Returns:
+        str: CSS-класс для бейджа
+    """
+    if threat_level == "Низкий":
+        return "threat-low"
+    elif threat_level == "Средний":
+        return "threat-medium"
+    elif threat_level == "Высокий":
+        return "threat-high"
+    elif threat_level == "Критический":
+        return "threat-critical"
+    return ""
+
+def format_dns_response(response: str, data: Dict[str, Any]) -> str:
+    """
+    Форматирует DNS-ответ с учетом наличия IP в черных списках.
+    
+    Args:
+        response: Строка с DNS-ответом
+        data: Словарь с данными отчета
+        
+    Returns:
+        str: Отформатированная строка с DNS-ответом
+    """
+    if not response or not isinstance(response, str):
+        return str(response)
+    
+    ip_pattern = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+    ips = [ip.strip() for ip in response.split(',')]
+    
+    formatted_parts = []
+    for ip in ips:
+        if ip_pattern.match(ip):
+            is_blacklisted, threat_level, threat_score = get_threat_info_for_ip(ip, data)
+            if is_blacklisted:
+                formatted_parts.append(f"\033[91m{ip} ({threat_level}: {threat_score})\033[0m")
+            else:
+                formatted_parts.append(f"\033[92m{ip}\033[0m")
+        else:
+            formatted_parts.append(ip)
+    
+    return ", ".join(formatted_parts)
 
 def generate_txt_report(output_path: str, data: Dict[str, Any]) -> None:
+    """
+    Генерирует текстовый отчет об анализе сетевого трафика.
+    
+    Args:
+        output_path: Путь к файлу отчета
+        data: Словарь с данными отчета
+    """
     with open(output_path, "w", encoding="utf-8") as f:
-        for ip, info in data.items():
-            if ip == "Overall Packet Statistics":
-                continue
-            f.write(f"{ip}\n")
+        ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
+        sorted_ips = sorted(ip_keys, key=ip_sort_key)
+        
+        for ip in sorted_ips:
+            info = data[ip]
+            f.write(f"IP: {ip}\n")
+
             dns_assocs = info.get("DNS Associations", [])
-            sni_records = info.get("SNI Records", [])
             if dns_assocs:
-                f.write("DNS Associations: ")
+                f.write("DNS Associations:\n")
                 for assoc in dns_assocs:
-                    f.write(f"{assoc}\n")
+                    f.write(f"  - {assoc}\n")
+
+            sni_records = info.get("SNI Records", [])
             if sni_records:
-                f.write("SNI Records: ")
+                f.write("SNI Records:\n")
                 for record in sni_records:
-                    f.write(f"{record}\n")
-            f.write("\n")
+                    f.write(f"  - {record}\n")
+            
+            f.write("-" * 50 + "\n")
+    
     print(f"[*] TXT Report saved to '{output_path}'")

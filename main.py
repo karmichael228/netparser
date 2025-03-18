@@ -16,6 +16,9 @@ def main() -> None:
     parser.add_argument("--json", metavar="JSON_PATH", help="Generate JSON report at specified path")
     parser.add_argument("--compare", metavar="COMPARE_FILE", help="Path to the second PCAP file for comparison")
     parser.add_argument("--txt", metavar="TXT_PATH", help="Generate TXT report at specified path")
+    parser.add_argument("--check-blacklists", action="store_true", help="Check IP addresses against blacklists")
+    parser.add_argument("--no-check-blacklists", action="store_false", dest="check_blacklists", help="Do not check IP addresses against blacklists")
+    parser.set_defaults(check_blacklists=True)
     args = parser.parse_args()
 
     try:
@@ -26,13 +29,15 @@ def main() -> None:
                 generate_report(args.json, unique_traffic)
             if args.html:
                 generate_html_report(args.html, unique_traffic)
+            if args.txt:
+                generate_txt_report(args.txt, unique_traffic)
         else:
             filters = None
             if args.filter:
                 filter_terms = [term.strip() for term in args.filter.upper().split(",")]
                 filters = lambda pkt: any(term in str(pkt).upper() for term in filter_terms)
 
-            net_parser = NetParser()
+            net_parser = NetParser(check_blacklists=args.check_blacklists)
             net_parser.analyze(args.pcap_file, filters=filters)
             report_data = net_parser.get_dict()
             print_report(report_data)
@@ -43,8 +48,8 @@ def main() -> None:
                 generate_html_report(args.html, report_data)
             if args.txt:
                 generate_txt_report(args.txt, report_data)
-    except Exception:
-        sys.exit("An error occurred during processing. Please check error.log for details.")
+    except Exception as e:
+        sys.exit(f"An error occurred during processing: {str(e)}. Please check error.log for details.")
 
 
 if __name__ == "__main__":

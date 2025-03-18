@@ -3,3 +3,5 @@ tqdm
 pyasn
 pyshark
 jinja2
+requests
+tabulate

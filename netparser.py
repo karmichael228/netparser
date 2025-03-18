@@ -4,22 +4,79 @@ import sys
 import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Callable, Any, Dict, Set, Generator, List
+from typing import Optional, Callable, Any, Dict, Set, Generator, List, Union, Tuple
 import threading
 import os
-from scapy.all import IP, TCP, UDP, ICMP, DNS, DNSQR, DNSRR, PcapReader, Packet, Raw
+import requests
+import tempfile
+import time
+from scapy.all import IP, TCP, UDP, ICMP, DNS, PcapReader, Packet, Raw
 from tqdm import tqdm
 import pyasn
 
+class NetParserError(Exception):
+    """Базовый класс для исключений NetParser."""
+    pass
+
+class PCAPFileError(NetParserError):
+    """Исключение для ошибок, связанных с PCAP файлами."""
+    pass
+
+class ASNDatabaseError(NetParserError):
+    """Исключение для ошибок, связанных с базой ASN."""
+    pass
+
+class PacketProcessingError(NetParserError):
+    """Исключение для ошибок обработки пакетов."""
+    pass
+
+class ValidationError(NetParserError):
+    """Исключение для ошибок валидации данных."""
+    pass
+
 DNS_TYPE_MAP = {
-    1: "A",
-    2: "NS",
-    5: "CNAME",
-    6: "SOA",
-    12: "PTR",
-    15: "MX",
-    16: "TXT",
-    28: "AAAA",
+    1: "A",           # IPv4 адрес
+    2: "NS",          # Авторитетный сервер имен
+    5: "CNAME",       # Каноническое имя
+    6: "SOA",         # Начало зоны
+    12: "PTR",        # Указатель
+    15: "MX",         # Почтовый обменник
+    16: "TXT",        # Текстовые записи
+    17: "RP",         # Ответственное лицо
+    18: "AFSDB",      # AFS база данных
+    24: "SIG",        # Подпись
+    25: "KEY",        # Ключ
+    28: "AAAA",       # IPv6 адрес
+    29: "LOC",        # Географическое местоположение
+    33: "SRV",        # Сервис
+    35: "NAPTR",      # Naming Authority Pointer
+    36: "KX",         # Key Exchanger
+    37: "CERT",       # Сертификат
+    39: "DNAME",      # Delegation Name
+    42: "APL",        # Address Prefix List
+    43: "DS",         # Delegation Signer
+    44: "SSHFP",      # SSH Fingerprint
+    45: "IPSECKEY",   # IPSEC Key
+    46: "RRSIG",      # DNSSEC Signature
+    47: "NSEC",       # Next Secure
+    48: "DNSKEY",     # DNS Key
+    49: "DHCID",      # DHCP Identifier
+    50: "NSEC3",      # Next Secure v3
+    51: "NSEC3PARAM", # NSEC3 Parameters
+    52: "TLSA",       # TLSA Certificate Association
+    55: "HIP",        # Host Identity Protocol
+    59: "CDS",        # Child DS
+    60: "CDNSKEY",    # Child DNSKEY
+    99: "SPF",        # Sender Policy Framework
+    108: "EUI48",     # EUI-48 Identifier
+    109: "EUI64",     # EUI-64 Identifier
+    249: "TKEY",      # Transaction Key
+    250: "TSIG",      # Transaction Signature
+    251: "IXFR",      # Incremental Zone Transfer
+    252: "AXFR",      # Zone Transfer
+    257: "CAA",       # Certification Authority Authorization
+    32768: "TA",      # DNSSEC Trust Authorities
+    32769: "DLV",     # DNSSEC Lookaside Validation
 }
 
 class Logger:
@@ -51,23 +108,136 @@ class ASNDatabase:
     """
     def __init__(self, asndb_path: str, as_names_file: str) -> None:
         if not os.path.exists(asndb_path) or not os.path.exists(as_names_file):
-            raise FileNotFoundError("ASN database files not found.")
-        self.asndb = pyasn.pyasn(asndb_path, as_names_file=as_names_file)
+            raise ASNDatabaseError(f"ASN database files not found: {asndb_path}, {as_names_file}")
+        try:
+            self.asndb = pyasn.pyasn(asndb_path, as_names_file=as_names_file)
+        except Exception as e:
+            raise ASNDatabaseError(f"Failed to initialize ASN database: {str(e)}")
         self.asn_cache: Dict[str, str] = {}
         self.lock = threading.Lock()
 
     def lookup_asn(self, ip: str) -> str:
+        if not self._is_valid_ipv4(ip):
+            raise ValidationError(f"Invalid IP address format: {ip}")
         with self.lock:
             if ip in self.asn_cache:
                 return self.asn_cache[ip]
         try:
             asn_info = self.asndb.lookup(ip)
             asn_name = self.asndb.get_as_name(asn_info[0]) if asn_info else '<NOT FOUND>'
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"ASN lookup failed for IP {ip}: {str(e)}")
             asn_name = '<NOT FOUND>'
         with self.lock:
             self.asn_cache[ip] = asn_name
         return asn_name
+
+    @staticmethod
+    def _is_valid_ipv4(ip: str) -> bool:
+        """Проверяет, является ли строка корректным IPv4 адресом."""
+        return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip))
+
+class IpsumBlacklist:
+    """
+    Класс для работы с базой черных IP из репозитория ipsum.
+    Загружает список подозрительных/вредоносных IP-адресов и предоставляет методы для их проверки.
+    """
+    IPSUM_URL = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
+    CACHE_TTL = 86400  # 24 часа (в секундах)
+    
+    def __init__(self, cache_dir: Optional[str] = None):
+        self.logger = Logger.setup_logger()
+        self.blacklist: Dict[str, int] = {}
+        self.lock = threading.Lock()
+        self.last_update = 0
+        self.cache_dir = cache_dir or tempfile.gettempdir()
+        self.cache_file = os.path.join(self.cache_dir, "ipsum_blacklist.txt")
+        self._load_blacklist()
+    
+    def _load_blacklist(self) -> None:
+        """Загружает черный список IP-адресов."""
+        with self.lock:
+            try:
+                # Проверяем, нужно ли обновить кэш
+                if os.path.exists(self.cache_file):
+                    file_mod_time = os.path.getmtime(self.cache_file)
+                    if time.time() - file_mod_time < self.CACHE_TTL:
+                        self._parse_blacklist_file()
+                        self.logger.info(f"Loaded IP blacklist from cache ({len(self.blacklist)} entries)")
+                        return
+                
+                # Загружаем свежий список
+                self.logger.info("Updating IP blacklist from repository...")
+                response = requests.get(self.IPSUM_URL, timeout=30)
+                response.raise_for_status()
+                
+                # Сохраняем в кэш
+                with open(self.cache_file, 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                
+                self._parse_blacklist_file()
+                self.last_update = time.time()
+                self.logger.info(f"Successfully updated IP blacklist ({len(self.blacklist)} entries)")
+            except Exception as e:
+                self.logger.warning(f"Failed to update IP blacklist: {str(e)}")
+                # Пытаемся загрузить из кэша, если он существует
+                if os.path.exists(self.cache_file):
+                    self._parse_blacklist_file()
+                    self.logger.info(f"Loaded IP blacklist from cache ({len(self.blacklist)} entries)")
+    
+    def _parse_blacklist_file(self) -> None:
+        """Парсит файл с черным списком IP."""
+        try:
+            with open(self.cache_file, 'r', encoding='utf-8') as f:
+                self.blacklist.clear()
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            ip = parts[0]
+                            try:
+                                score = int(parts[1])
+                                self.blacklist[ip] = score
+                            except ValueError:
+                                pass
+        except Exception as e:
+            self.logger.error(f"Error parsing blacklist file: {str(e)}")
+    
+    def check_ip(self, ip: str) -> Tuple[bool, int]:
+        """
+        Проверяет, находится ли IP в черном списке.
+        
+        Args:
+            ip: IP-адрес для проверки
+            
+        Returns:
+            Tuple[bool, int]: (есть_в_черном_списке, счетчик_угрозы)
+        """
+        with self.lock:
+            score = self.blacklist.get(ip, 0)
+            return score > 0, score
+    
+    def get_threat_level(self, score: int) -> str:
+        """
+        Определяет уровень угрозы на основе счетчика.
+        
+        Args:
+            score: Счетчик встречаемости IP в черных списках
+            
+        Returns:
+            str: Текстовое описание уровня угрозы
+        """
+        if score <= 0:
+            return "Безопасный"
+        elif score <= 2:
+            return "Низкий"
+        elif score <= 4:
+            return "Средний"
+        elif score <= 6:
+            return "Высокий"
+        else:
+            return "Критический"
 
 class NetParser:
     """
@@ -76,12 +246,13 @@ class NetParser:
     """
     def __init__(self,
                  asndb_path: str = "./asndb/ipasndb.dat",
-                 as_names_file: str = "./asndb/asnname.json") -> None:
+                 as_names_file: str = "./asndb/asnname.json",
+                 check_blacklists: bool = True) -> None:
         self.logger = Logger.setup_logger()
-        self.http_domains: Dict[str, Set[str]] = defaultdict(set)
-        self.http_requests: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-        self.dns_associations: Dict[str, Set[str]] = defaultdict(set)
-        self.sni_by_ip: Dict[str, Set[str]] = defaultdict(set)
+        self.http_domains: Dict[str, Set[str]] = {}
+        self.http_requests: Dict[str, List[Dict[str, str]]] = {}
+        self.dns_associations: Dict[str, Set[str]] = {}
+        self.sni_by_ip: Dict[str, Set[str]] = {}
         self.output_data: Dict[str, Dict[str, int]] = {}
         self.ip_list_conn: Set[str] = set()
         self.asn_database = ASNDatabase(asndb_path, as_names_file)
@@ -96,10 +267,35 @@ class NetParser:
             "total_bytes": 0
         }
         self.data_lock = threading.Lock()
-        # Для клиентов – сохраняем DNS запросы с указанием DNS сервера
-        self.dns_queries_by_server: Dict[str, Dict[str, Set[str]]] = defaultdict(lambda: defaultdict(set))
-        # Для DNS серверов – сохраняем все ответы (без агрегации на этапе захвата)
-        self.dns_response_table: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self.dns_queries_by_server: Dict[str, Dict[str, Set[str]]] = {}
+        self.dns_response_table: Dict[str, List[Dict[str, Any]]] = {}
+        self.check_blacklists = check_blacklists
+        self.ip_blacklist = IpsumBlacklist() if check_blacklists else None
+        self.ip_threat_info: Dict[str, Tuple[bool, int]] = {}  # Информация о угрозе {ip: (в_черном_списке, счетчик)}
+
+    def _get_or_create_set(self, d: Dict[str, Set[str]], key: str) -> Set[str]:
+        """Получает существующий Set или создает новый."""
+        if key not in d:
+            d[key] = set()
+        return d[key]
+
+    def _get_or_create_dict(self, d: Dict[str, Dict[str, Set[str]]], key: str) -> Dict[str, Set[str]]:
+        """Получает существующий Dict или создает новый."""
+        if key not in d:
+            d[key] = {}
+        return d[key]
+
+    def _get_or_create_list(self, d: Dict[str, List[Dict[str, str]]], key: str) -> List[Dict[str, str]]:
+        """Получает существующий List или создает новый."""
+        if key not in d:
+            d[key] = []
+        return d[key]
+
+    def _get_or_create_int_dict(self, d: Dict[str, Dict[str, int]], key: str) -> Dict[str, int]:
+        """Получает существующий Dict[int] или создает новый."""
+        if key not in d:
+            d[key] = {}
+        return d[key]
 
     @staticmethod
     def _normalize_ipv4(ip: str) -> str:
@@ -123,90 +319,141 @@ class NetParser:
 
     def parse_http_request(self, payload: str) -> Optional[Dict[str, str]]:
         """Парсит HTTP запрос из полезной нагрузки."""
-        lines = payload.splitlines()
-        if not lines:
+        try:
+            lines = payload.splitlines()
+            if not lines:
+                return None
+            request_line_pattern = re.compile(r"^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/\d\.\d)")
+            match = request_line_pattern.match(lines[0])
+            if not match:
+                return None
+            http_data = {
+                "method": match.group(1),
+                "uri": match.group(2),
+                "version": match.group(3),
+                "host": "",
+                "user_agent": ""
+            }
+            for line in lines[1:]:
+                if ':' not in line:
+                    continue
+                header, value = line.split(":", 1)
+                header = header.strip().lower()
+                value = value.strip()
+                if header == "host":
+                    http_data["host"] = value
+                elif header == "user-agent":
+                    http_data["user_agent"] = value
+            return http_data
+        except Exception as e:
+            self.logger.debug(f"Error parsing HTTP request: {str(e)}")
             return None
-        request_line_pattern = re.compile(r"^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/\d\.\d)")
-        match = request_line_pattern.match(lines[0])
-        if not match:
-            return None
-        http_data = {
-            "method": match.group(1),
-            "uri": match.group(2),
-            "version": match.group(3),
-            "host": "",
-            "user_agent": ""
-        }
-        for line in lines[1:]:
-            if ':' not in line:
-                continue
-            header, value = line.split(":", 1)
-            header = header.strip().lower()
-            value = value.strip()
-            if header == "host":
-                http_data["host"] = value
-            elif header == "user-agent":
-                http_data["user_agent"] = value
-        return http_data
+
+    def handle_tls_pkt(self, pkt: Packet) -> None:
+        """Обрабатывает TLS пакет и извлекает SNI."""
+        try:
+            if TCP in pkt and pkt[TCP].dport == 443 and pkt.haslayer(Raw):
+                raw_payload = pkt[Raw].load
+                sni = self.extract_sni_from_tls(raw_payload)
+                if sni:
+                    ip = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
+                    with self.data_lock:
+                        self._get_or_create_set(self.sni_by_ip, ip).add(sni)
+        except Exception as e:
+            self.logger.debug(f"Error processing TLS packet: {str(e)}")
 
     def handle_dns_pkt(self, pkt: Packet) -> None:
         """Обрабатывает DNS пакет, аккумулируя запросы и ответы."""
-        try:
-            if UDP in pkt and (pkt[UDP].sport == 5353 or pkt[UDP].dport == 5353):
-                return
+        if UDP in pkt and (pkt[UDP].sport == 5353 or pkt[UDP].dport == 5353):
+            return
 
-            dns_layer = pkt.getlayer(DNS)
-            if not dns_layer:
-                return
+        dns_layer = pkt.getlayer(DNS)
+        if not dns_layer:
+            return
+
+        try:
+            ip_src = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
+            ip_dst = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
 
             # Обработка DNS запросов
             if dns_layer.qdcount and dns_layer.qd:
                 queries = dns_layer.qd if isinstance(dns_layer.qd, list) else [dns_layer.qd]
-                ip_src = self._normalize_ipv4(pkt[IP].src) if IP in pkt else '<UNKNOWN>'
-                ip_dst = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
                 with self.data_lock:
+                    server_dict = self._get_or_create_dict(self.dns_queries_by_server, ip_src)
+                    target_set = self._get_or_create_set(server_dict, ip_dst)
                     for query in queries:
                         if hasattr(query, 'qname') and query.qname:
                             qname = query.qname.decode() if isinstance(query.qname, bytes) else query.qname
-                            qname = qname.rstrip('.')  # удаляем завершающую точку
-                            self.dns_queries_by_server[ip_src][ip_dst].add(qname)
+                            qtype = getattr(query, 'qtype', 1)  # По умолчанию A запрос
+                            type_str = DNS_TYPE_MAP.get(qtype, str(qtype))
+                            target_set.add(f"{qname.rstrip('.')} ({type_str})")
 
             # Обработка DNS ответов
             if dns_layer.qr == 1 and dns_layer.ancount and dns_layer.an:
-                ip_src = pkt[IP].src if IP in pkt else '<UNKNOWN>'
-                dns_server_ip = self._normalize_ipv4(ip_src)
+                dns_server_ip = ip_src
                 answers = dns_layer.an if isinstance(dns_layer.an, list) else [dns_layer.an]
                 with self.data_lock:
+                    response_list = self._get_or_create_list(self.dns_response_table, dns_server_ip)
                     for answer in answers:
                         try:
                             rrname = (answer.rrname.decode() if isinstance(answer.rrname, bytes)
-                                      else answer.rrname) if answer.rrname else '<UNKNOWN>'
-                        except Exception:
-                            rrname = '<UNKNOWN>'
-                        rrname = rrname.rstrip('.')
-                        try:
+                                    else answer.rrname).rstrip('.') if answer.rrname else '<UNKNOWN>'
                             rdata = answer.rdata
-                        except AttributeError:
-                            rdata = None
-                        if isinstance(rdata, bytes):
-                            rdata = rdata.decode(errors='ignore')
-                        if rdata and self._is_valid_ipv4(rdata):
-                            self.dns_associations[rdata].add(rrname)
-                        try:
+                            if isinstance(rdata, bytes):
+                                rdata = rdata.decode(errors='ignore')
+                            
                             ans_type = getattr(answer, 'type', 'UNKNOWN')
-                        except Exception:
-                            ans_type = 'UNKNOWN'
-                        type_str = DNS_TYPE_MAP.get(ans_type, str(ans_type))
-                        ans_value = rdata if rdata else "<NO_DATA>"
-                        if type_str != "A" and isinstance(ans_value, str):
-                            ans_value = ans_value.rstrip('.')
-                        self.dns_response_table[dns_server_ip].append({
-                            "name": rrname,
-                            "type": type_str,
-                            "resolution": ans_value
-                        })
-        except Exception:
-            self.logger.exception("Error handling DNS packet:")
+                            type_str = DNS_TYPE_MAP.get(ans_type, str(ans_type))
+                            
+                            # Специальная обработка для разных типов записей
+                            if type_str == "A" and rdata and self._is_valid_ipv4(rdata):
+                                self._get_or_create_set(self.dns_associations, rdata).add(rrname)
+                                
+                                # Проверяем IP из DNS-ответа на наличие в черных списках
+                                if self.check_blacklists and self.ip_blacklist and rdata not in self.ip_threat_info:
+                                    self.ip_threat_info[rdata] = self.ip_blacklist.check_ip(rdata)
+                                
+                            elif type_str == "AAAA" and rdata:
+                                # Обработка IPv6 адресов
+                                self._get_or_create_set(self.dns_associations, rdata).add(rrname)
+                            elif type_str == "CNAME" and rdata:
+                                # Обработка CNAME записей
+                                rdata = rdata.rstrip('.')
+                            elif type_str == "MX" and rdata:
+                                # Обработка MX записей
+                                try:
+                                    priority, server = rdata.split(' ', 1)
+                                    rdata = f"Priority: {priority}, Server: {server.rstrip('.')}"
+                                except ValueError:
+                                    rdata = rdata.rstrip('.')
+                            elif type_str == "TXT" and rdata:
+                                # Обработка TXT записей
+                                rdata = rdata.strip('"')
+                            elif type_str == "SRV" and rdata:
+                                # Обработка SRV записей
+                                try:
+                                    priority, weight, port, target = rdata.split(' ', 3)
+                                    rdata = f"Priority: {priority}, Weight: {weight}, Port: {port}, Target: {target.rstrip('.')}"
+                                except ValueError:
+                                    rdata = rdata.rstrip('.')
+                            elif type_str == "SOA" and rdata:
+                                # Обработка SOA записей
+                                try:
+                                    mname, rname, serial, refresh, retry, expire, minimum = rdata.split(' ', 6)
+                                    rdata = f"MNAME: {mname.rstrip('.')}, RNAME: {rname}, SERIAL: {serial}"
+                                except ValueError:
+                                    rdata = rdata.rstrip('.')
+                            
+                            response_list.append({
+                                "name": rrname,
+                                "type": type_str,
+                                "resolution": rdata if rdata else "<NO_DATA>"
+                            })
+                        except Exception as e:
+                            self.logger.debug(f"Error processing DNS answer: {str(e)}")
+                            continue
+        except Exception as e:
+            self.logger.debug(f"Error handling DNS packet: {str(e)}")
 
     def extract_sni_scapy(self, pcap_file: str) -> None:
         """Извлекает SNI из TLS-пакетов."""
@@ -219,7 +466,7 @@ class NetParser:
                         if sni:
                             ip = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
                             with self.data_lock:
-                                self.sni_by_ip[ip].add(sni)
+                                self._get_or_create_set(self.sni_by_ip, ip).add(sni)
         except Exception:
             self.logger.exception("Error extracting SNI using Scapy.")
 
@@ -299,61 +546,75 @@ class NetParser:
     def process_packets(self, packets: List[Packet],
                         filters: Optional[Callable[[Packet], bool]] = None) -> None:
         for pkt in packets:
-            with self.data_lock:
-                self.packet_statistics["total_packets"] += 1
-                self.packet_statistics["total_bytes"] += len(pkt)
-            if filters and not filters(pkt):
-                continue
-            if IP in pkt:
-                ip_src = self._normalize_ipv4(pkt[IP].src)
-                ip_dst = self._normalize_ipv4(pkt[IP].dst)
+            try:
                 with self.data_lock:
-                    self.ip_list_conn.update([ip_src, ip_dst])
-                    self.output_data.setdefault(ip_src, defaultdict(int))
-                    self.output_data.setdefault(ip_dst, defaultdict(int))
-                    self.output_data[ip_src]["packets_out"] += 1
-                    self.output_data[ip_src]["bytes_out"] += len(pkt)
-                    self.output_data[ip_dst]["packets_in"] += 1
-                    self.output_data[ip_dst]["bytes_in"] += len(pkt)
-                if TCP in pkt:
-                    with self.data_lock:
-                        self.packet_statistics["tcp_count"] += 1
-                        self.output_data[ip_src]["tcp_count"] += 1
-                        self.output_data[ip_dst]["tcp_count"] += 1
-                    if pkt[TCP].dport == 80 and pkt.haslayer(Raw):
+                    self.packet_statistics["total_packets"] += 1
+                    self.packet_statistics["total_bytes"] += len(pkt)
+                if filters and not filters(pkt):
+                    continue
+                if IP in pkt:
+                    ip_src = self._normalize_ipv4(pkt[IP].src)
+                    ip_dst = self._normalize_ipv4(pkt[IP].dst)
+                    
+                    # Проверяем IP на наличие в черных списках
+                    if self.check_blacklists and self.ip_blacklist:
                         with self.data_lock:
-                            self.packet_statistics["http_count"] += 1
-                        try:
-                            raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
-                            host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
-                            if host_match:
-                                with self.data_lock:
-                                    self.http_domains[ip_dst].add(host_match.group(1).strip())
-                            http_data = self.parse_http_request(raw_payload)
-                            if http_data:
-                                with self.data_lock:
-                                    self.http_requests[ip_dst].append(http_data)
-                        except Exception:
-                            self.logger.exception("Error extracting HTTP request details:")
-                    elif pkt[TCP].dport == 443:
+                            if ip_src not in self.ip_threat_info:
+                                self.ip_threat_info[ip_src] = self.ip_blacklist.check_ip(ip_src)
+                            if ip_dst not in self.ip_threat_info:
+                                self.ip_threat_info[ip_dst] = self.ip_blacklist.check_ip(ip_dst)
+                    
+                    with self.data_lock:
+                        self.ip_list_conn.update([ip_src, ip_dst])
+                        src_stats = self._get_or_create_int_dict(self.output_data, ip_src)
+                        dst_stats = self._get_or_create_int_dict(self.output_data, ip_dst)
+                        src_stats["packets_out"] = src_stats.get("packets_out", 0) + 1
+                        src_stats["bytes_out"] = src_stats.get("bytes_out", 0) + len(pkt)
+                        dst_stats["packets_in"] = dst_stats.get("packets_in", 0) + 1
+                        dst_stats["bytes_in"] = dst_stats.get("bytes_in", 0) + len(pkt)
+                    if TCP in pkt:
                         with self.data_lock:
-                            self.packet_statistics["https_count"] += 1
-                elif UDP in pkt:
-                    with self.data_lock:
-                        self.packet_statistics["udp_count"] += 1
-                        self.output_data[ip_src]["udp_count"] += 1
-                        self.output_data[ip_dst]["udp_count"] += 1
-                elif ICMP in pkt:
-                    with self.data_lock:
-                        self.packet_statistics["icmp_count"] += 1
-                        self.output_data[ip_src]["icmp_count"] += 1
-                        self.output_data[ip_dst]["icmp_count"] += 1
-                if DNS in pkt:
-                    with self.data_lock:
-                        self.packet_statistics["dns_count"] += 1
-                        self.output_data[ip_src]["dns_count"] += 1
-                        self.output_data[ip_dst]["dns_count"] += 1
-                    self.handle_dns_pkt(pkt)
+                            self.packet_statistics["tcp_count"] += 1
+                            src_stats["tcp_count"] = src_stats.get("tcp_count", 0) + 1
+                            dst_stats["tcp_count"] = dst_stats.get("tcp_count", 0) + 1
+                        if pkt[TCP].dport == 80 and pkt.haslayer(Raw):
+                            with self.data_lock:
+                                self.packet_statistics["http_count"] += 1
+                            try:
+                                raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
+                                host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
+                                if host_match:
+                                    with self.data_lock:
+                                        self._get_or_create_set(self.http_domains, ip_dst).add(host_match.group(1).strip())
+                                http_data = self.parse_http_request(raw_payload)
+                                if http_data:
+                                    with self.data_lock:
+                                        self._get_or_create_list(self.http_requests, ip_dst).append(http_data)
+                            except Exception as e:
+                                self.logger.debug(f"Error processing HTTP request: {str(e)}")
+                        elif pkt[TCP].dport == 443:
+                            with self.data_lock:
+                                self.packet_statistics["https_count"] += 1
+                            self.handle_tls_pkt(pkt)
+                    elif UDP in pkt:
+                        with self.data_lock:
+                            self.packet_statistics["udp_count"] += 1
+                            src_stats["udp_count"] = src_stats.get("udp_count", 0) + 1
+                            dst_stats["udp_count"] = dst_stats.get("udp_count", 0) + 1
+                        if ICMP in pkt:
+                            with self.data_lock:
+                                self.packet_statistics["icmp_count"] += 1
+                                src_stats["icmp_count"] = src_stats.get("icmp_count", 0) + 1
+                                dst_stats["icmp_count"] = dst_stats.get("icmp_count", 0) + 1
+                    if DNS in pkt:
+                        with self.data_lock:
+                            self.packet_statistics["dns_count"] += 1
+                            src_stats["dns_count"] = src_stats.get("dns_count", 0) + 1
+                            dst_stats["dns_count"] = dst_stats.get("dns_count", 0) + 1
+                        self.handle_dns_pkt(pkt)
+            except Exception as e:
+                self.logger.debug(f"Error processing packet: {str(e)}")
+                continue
 
     def process_in_parallel(self, pcap_file: str,
                             num_threads: int = 4,
@@ -364,105 +625,188 @@ class NetParser:
                     for pkt in reader:
                         yield pkt
             except FileNotFoundError as e:
-                self.logger.error(f"PCAP file not found: {pcap_file}")
-                raise e
-            except Exception:
-                self.logger.exception("Error while reading PCAP file:")
-                raise
+                raise PCAPFileError(f"PCAP file not found: {pcap_file}") from e
+            except Exception as e:
+                raise PacketProcessingError(f"Error reading PCAP file: {str(e)}") from e
 
         chunk_size = 1000
         futures = []
         chunk: List[Packet] = []
         executor = ThreadPoolExecutor(max_workers=num_threads)
-        for packet in tqdm(packet_iterator(), desc="Reading packets", unit="pkt"):
-            chunk.append(packet)
-            if len(chunk) >= chunk_size:
+        try:
+            for packet in tqdm(packet_iterator(), desc="Reading packets", unit="pkt"):
+                chunk.append(packet)
+                if len(chunk) >= chunk_size:
+                    futures.append(executor.submit(self.process_packets, chunk, filters))
+                    chunk = []
+            if chunk:
                 futures.append(executor.submit(self.process_packets, chunk, filters))
-                chunk = []
-        if chunk:
-            futures.append(executor.submit(self.process_packets, chunk, filters))
-        for future in futures:
-            future.result()
-        executor.shutdown()
+            for future in futures:
+                future.result()
+        except Exception as e:
+            self.logger.error(f"Error in parallel processing: {str(e)}")
+            raise
+        finally:
+            executor.shutdown()
 
     def analyze(self, pcap_file: str,
                 filters: Optional[Callable[[Packet], bool]] = None) -> Dict[str, Any]:
         self.logger.info("[*] Starting PCAP analysis...")
-        self.process_in_parallel(pcap_file, filters=filters)
-        self.extract_sni_scapy(pcap_file)
-        return self.output_data
+        try:
+            self.process_in_parallel(pcap_file, filters=filters)
+            return self.output_data
+        except Exception as e:
+            self.logger.error(f"Analysis failed: {str(e)}")
+            raise
 
     def get_dict(self) -> Dict[str, Any]:
         """
         Формирует итоговый словарь с данными по IP.
-        Для клиента выводится только таблица "DNS Queries by Server".
-        Для DNS сервера – таблица "DNS Responses" (без дубликатов, с объединением записей по домену).
+        Оптимизированная версия с предварительной сортировкой и кэшированием.
         """
-        ip_dns_sni_map: Dict[str, Any] = {}
-        with self.data_lock:
-            ips = sorted(list(self.ip_list_conn), key=self._ip_sort_key)
-        for ip in ips:
-            ip_norm = self._normalize_ipv4(ip)
+        try:
+            ip_dns_sni_map: Dict[str, Any] = {}
             with self.data_lock:
-                dns_assocs = sorted([d.rstrip('.') for d in self.dns_associations.get(ip_norm, [])])
-                sni_records = sorted(list(self.sni_by_ip.get(ip_norm, [])))
-                http_hosts = sorted(list(self.http_domains.get(ip_norm, [])))
-                raw_stats = dict(self.output_data.get(ip_norm, {}))
-                dns_queries = self.dns_queries_by_server.get(ip_norm, {})
-                dns_resps = self.dns_response_table.get(ip_norm, [])
-            if dns_resps and len(dns_resps) > 0:
-                aggregated = {}
-                for resp in dns_resps:
-                    name = resp.get("name", "").rstrip('.')
-                    type_str = resp.get("type", "")
-                    resolution = resp.get("resolution", "")
-                    if type_str != "A" and isinstance(resolution, str):
-                        resolution = resolution.rstrip('.')
-                    key = (name, type_str)
-                    if key in aggregated:
-                        current = aggregated[key]
-                        new_vals = [x.strip() for x in resolution.split(",") if x.strip()]
-                        current.update(new_vals)
-                    else:
-                        new_vals = set(x.strip() for x in resolution.split(",") if x.strip())
-                        aggregated[key] = new_vals
-                aggregated_list = []
-                for (name, type_str), res_set in aggregated.items():
-                    resolution_str = ", ".join(sorted(res_set))
-                    aggregated_list.append({
-                        "name": name,
-                        "type": type_str,
-                        "resolution": resolution_str
-                    })
-                dns_info = {"DNS Responses": aggregated_list}
-            elif dns_queries:
-                dns_info = {"DNS Queries by Server": {
-                    server_ip.rstrip('.'): sorted([q.rstrip('.') for q in queries])
-                    for server_ip, queries in dns_queries.items()
-                }}
-            else:
-                dns_info = {}
-            traffic_stats = {k: raw_stats[k] for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"] if k in raw_stats}
-            protocol_stats = {k: v for k, v in raw_stats.items() if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]}
+                ips = sorted(list(self.ip_list_conn), key=self._ip_sort_key)
+            
+            # Предварительная обработка данных
+            for ip in ips:
+                ip_norm = self._normalize_ipv4(ip)
+                with self.data_lock:
+                    dns_assocs = sorted([d.rstrip('.') for d in self.dns_associations.get(ip_norm, [])])
+                    sni_records = sorted(list(self.sni_by_ip.get(ip_norm, [])))
+                    http_hosts = sorted(list(self.http_domains.get(ip_norm, [])))
+                    raw_stats = dict(self.output_data.get(ip_norm, {}))
+                    dns_queries = self.dns_queries_by_server.get(ip_norm, {})
+                    dns_resps = self.dns_response_table.get(ip_norm, [])
+                    
+                    # Получаем информацию о угрозе для IP
+                    is_blacklisted, threat_score = False, 0
+                    if self.check_blacklists:
+                        is_blacklisted, threat_score = self.ip_threat_info.get(ip_norm, (False, 0))
+                
+                # Обработка DNS ответов
+                if dns_resps:
+                    aggregated = {}
+                    for resp in dns_resps:
+                        name = resp.get("name", "").rstrip('.')
+                        type_str = resp.get("type", "")
+                        resolution = resp.get("resolution", "")
+                        if type_str != "A" and isinstance(resolution, str):
+                            resolution = resolution.rstrip('.')
+                        key = (name, type_str)
+                        if key in aggregated:
+                            current = aggregated[key]
+                            new_vals = [x.strip() for x in resolution.split(",") if x.strip()]
+                            current.update(new_vals)
+                        else:
+                            new_vals = set(x.strip() for x in resolution.split(",") if x.strip())
+                            aggregated[key] = new_vals
+                    
+                    aggregated_list = [
+                        {
+                            "name": name,
+                            "type": type_str,
+                            "resolution": ", ".join(sorted(res_set))
+                        }
+                        for (name, type_str), res_set in aggregated.items()
+                    ]
+                    dns_info = {"DNS Responses": aggregated_list}
+                elif dns_queries:
+                    dns_info = {
+                        "DNS Queries by Server": {
+                            server_ip.rstrip('.'): sorted([q.rstrip('.') for q in queries])
+                            for server_ip, queries in dns_queries.items()
+                        }
+                    }
+                else:
+                    dns_info = {}
+
+                # Формирование данных по IP
+                traffic_stats = {
+                    k: raw_stats[k] 
+                    for k in ["packets_in", "bytes_in", "packets_out", "bytes_out"] 
+                    if k in raw_stats
+                }
+                protocol_stats = {
+                    k: v 
+                    for k, v in raw_stats.items() 
+                    if k not in ["packets_in", "bytes_in", "packets_out", "bytes_out"]
+                }
+
+                # Обработка HTTP запросов
+                with self.data_lock:
+                    http_reqs = self.http_requests.get(ip_norm, [])
+                unique_reqs = {}
+                for req in http_reqs:
+                    key = tuple(sorted(req.items()))
+                    unique_reqs.setdefault(key, req)
+                unique_http_reqs = list(unique_reqs.values())
+
+                # Получение ASN
+                try:
+                    asn = self.asn_database.lookup_asn(ip_norm)
+                except Exception as e:
+                    self.logger.warning(f"Failed to get ASN for IP {ip_norm}: {str(e)}")
+                    asn = '<NOT FOUND>'
+
+                # Формирование итоговых данных
+                ip_data = {
+                    "ASN": asn,
+                    "DNS Associations": dns_assocs,
+                    "SNI Records": sni_records,
+                    "HTTP Domains": http_hosts,
+                    "HTTP Requests": unique_http_reqs,
+                    "Traffic": traffic_stats,
+                    "Protocols": protocol_stats
+                }
+                
+                # Добавляем информацию о наличии в черных списках
+                if self.check_blacklists:
+                    threat_info = {
+                        "is_blacklisted": is_blacklisted,
+                        "threat_score": threat_score,
+                    }
+                    if is_blacklisted and self.ip_blacklist:
+                        threat_info["threat_level"] = self.ip_blacklist.get_threat_level(threat_score)
+                    ip_data["Threat Info"] = threat_info
+                
+                ip_data.update(dns_info)
+                ip_dns_sni_map[ip_norm] = ip_data
+
+            # Добавляем информацию о угрозе для IP-адресов из DNS-ответов, 
+            # которые могут не встречаться в сетевом трафике напрямую
+            if self.check_blacklists and self.ip_blacklist:
+                with self.data_lock:
+                    for ip, (is_blacklisted, threat_score) in self.ip_threat_info.items():
+                        if ip not in ip_dns_sni_map and is_blacklisted and self._is_valid_ipv4(ip):
+                            # Добавляем информацию о IP только если он находится в черном списке
+                            ip_data = {
+                                "ASN": "<NOT FOUND>",
+                                "DNS Associations": [],
+                                "SNI Records": [],
+                                "HTTP Domains": [],
+                                "HTTP Requests": [],
+                                "Traffic": {},
+                                "Protocols": {},
+                                "Threat Info": {
+                                    "is_blacklisted": is_blacklisted,
+                                    "threat_score": threat_score,
+                                    "threat_level": self.ip_blacklist.get_threat_level(threat_score)
+                                }
+                            }
+                            # Пытаемся получить ASN
+                            try:
+                                ip_data["ASN"] = self.asn_database.lookup_asn(ip)
+                            except Exception:
+                                pass
+                            
+                            ip_dns_sni_map[ip] = ip_data
+            
             with self.data_lock:
-                http_reqs = self.http_requests.get(ip_norm, [])
-            unique_reqs = {}
-            for req in http_reqs:
-                key = tuple(sorted(req.items()))
-                unique_reqs.setdefault(key, req)
-            unique_http_reqs = list(unique_reqs.values())
-            asn = self.asn_database.lookup_asn(ip_norm)
-            ip_data = {
-                "ASN": asn,
-                "DNS Associations": dns_assocs,
-                "SNI Records": sni_records,
-                "HTTP Domains": http_hosts,
-                "HTTP Requests": unique_http_reqs,
-                "Traffic": traffic_stats,
-                "Protocols": protocol_stats
-            }
-            ip_data.update(dns_info)
-            ip_dns_sni_map[ip_norm] = ip_data
-        with self.data_lock:
-            ip_dns_sni_map["Overall Packet Statistics"] = dict(self.packet_statistics)
-        return ip_dns_sni_map
+                ip_dns_sni_map["Overall Packet Statistics"] = dict(self.packet_statistics)
+            
+            return ip_dns_sni_map
+        except Exception as e:
+            self.logger.error(f"Error generating report: {str(e)}")
+            raise
