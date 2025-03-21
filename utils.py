@@ -3,7 +3,10 @@ import json
 import re
 from typing import Any, Dict, List, Tuple, Optional, Set
 from jinja2 import Template
-from netparser import NetParser, IpsumBlacklist
+try:
+    from netparser import NetParser, IpsumBlacklist
+except ImportError:
+    from netparser.netparser import NetParser, IpsumBlacklist
 from tabulate import tabulate
 from termcolor import colored
 import datetime
@@ -384,7 +387,7 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                         {% if is_blacklisted %}
                             <p class="threat-ip">Статус: В черном списке - {{ threat_level }} ({{ threat_score }})</p>
                         {% else %}
-                            <p class="safe-ip">Статус: Отсуствует в черном спсике </p>
+                            <p class="safe-ip">Статус: Отсуствует в черном списке </p>
                         {% endif %}
                     </div>
                     
@@ -397,7 +400,7 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                     <!-- DNS ассоциации -->
                     {% if ip_data.get('DNS Associations') %}
                     <div class="section-title">
-                        <h3>DNS-ассоциации</h3>
+                        <h3>DNS-разрешения</h3>
                         <ul>
                         {% for assoc in ip_data.get('DNS Associations', []) %}
                             <li>{{ assoc }}</li>
