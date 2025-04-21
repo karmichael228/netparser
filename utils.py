@@ -48,17 +48,37 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 }
                 plugin_data["Threat Info"] = threat_info
         else:
-            unique_dns = set(plugin_data["DNS Associations"]) - set(base_data["DNS Associations"])
-            unique_sni = set(plugin_data["SNI Records"]) - set(base_data["SNI Records"])
+            unique_dns = set(plugin_data.get("DNS Associations", [])) - set(base_data.get("DNS Associations", []))
+            unique_sni = set(plugin_data.get("SNI Records", [])) - set(base_data.get("SNI Records", []))
             unique_http_domains = set(plugin_data.get("HTTP Domains", [])) - set(base_data.get("HTTP Domains", []))
             base_http_reqs: List[Dict[str, str]] = base_data.get("HTTP Requests", [])
             plugin_http_reqs: List[Dict[str, str]] = plugin_data.get("HTTP Requests", [])
-            unique_http_reqs = [req for req in plugin_http_reqs if req not in base_http_reqs]
+            
+            # Преобразование HTTP запросов в множества для сравнения
+            base_http_req_set = {tuple(sorted((k, v) for k, v in req.items() if v)) for req in base_http_reqs}
+            plugin_http_req_set = {tuple(sorted((k, v) for k, v in req.items() if v)) for req in plugin_http_reqs}
+            unique_http_req_tuples = plugin_http_req_set - base_http_req_set
+            
+            # Восстановление оригинальных запросов
+            unique_http_reqs = []
+            for req_tuple in unique_http_req_tuples:
+                for req in plugin_http_reqs:
+                    if tuple(sorted((k, v) for k, v in req.items() if v)) == req_tuple:
+                        unique_http_reqs.append(req)
+                        break
+            
             unique_asn = plugin_data["ASN"] if plugin_data["ASN"] != base_data["ASN"] else None
-            unique_packets = {
-                key: plugin_data["Protocols"].get(key, 0) - base_data["Protocols"].get(key, 0)
-                for key in plugin_data["Protocols"]
-            }
+            
+            # Правильный расчет уникальных пакетов (только положительные значения)
+            unique_protocols = {}
+            for key in set(plugin_data.get("Protocols", {})) | set(base_data.get("Protocols", {})):
+                plugin_value = plugin_data.get("Protocols", {}).get(key, 0)
+                base_value = base_data.get("Protocols", {}).get(key, 0)
+                diff = plugin_value - base_value
+                if diff > 0:  # Учитываем только положительные значения
+                    unique_protocols[key] = diff
+            
+            # Уникальные DNS запросы
             unique_dns_queries_by_server = {}
             plugin_queries = plugin_data.get("DNS Queries by Server", {})
             base_queries = base_data.get("DNS Queries by Server", {})
@@ -70,6 +90,11 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 if unique_queries:
                     unique_dns_queries_by_server[server_ip] = sorted(unique_queries)
             
+            # Уникальные соединения
+            unique_outgoing = set(plugin_data.get("Connections", {}).get("Outgoing", [])) - set(base_data.get("Connections", {}).get("Outgoing", []))
+            unique_incoming = set(plugin_data.get("Connections", {}).get("Incoming", [])) - set(base_data.get("Connections", {}).get("Incoming", []))
+            
+            # Получение информации о угрозе
             threat_info = None
             if is_blacklisted:
                 threat_info = {
@@ -77,6 +102,15 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                     "threat_score": threat_score,
                     "threat_level": ip_blacklist.get_threat_level(threat_score)
                 }
+            
+            # Правильный расчет уникального трафика (только положительные значения)
+            unique_traffic_stats = {}
+            for key in set(plugin_data.get("Traffic", {})) | set(base_data.get("Traffic", {})):
+                plugin_value = plugin_data.get("Traffic", {}).get(key, 0)
+                base_value = base_data.get("Traffic", {}).get(key, 0)
+                diff = plugin_value - base_value
+                if diff > 0:  # Учитываем только положительные значения
+                    unique_traffic_stats[key] = diff
             
             unique_traffic[ip] = {
                 "ASN": unique_asn if unique_asn else base_data["ASN"],
@@ -87,9 +121,12 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 "SNI Records": sorted(unique_sni),
                 "HTTP Domains": sorted(unique_http_domains),
                 "HTTP Requests": unique_http_reqs,
-                "Traffic": {key: plugin_data["Traffic"].get(key, 0) - base_data["Traffic"].get(key, 0)
-                            for key in set(plugin_data["Traffic"]) | set(base_data["Traffic"])},
-                "Protocols": {key: count for key, count in unique_packets.items() if count != 0}
+                "Traffic": unique_traffic_stats,
+                "Protocols": unique_protocols,
+                "Connections": {
+                    "Outgoing": sorted(unique_outgoing, key=ip_sort_key),
+                    "Incoming": sorted(unique_incoming, key=ip_sort_key)
+                }
             }
             
             # Добавляем информацию о угрозе, если IP в черном списке
@@ -99,8 +136,16 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
     if "Overall Packet Statistics" in base_traffic and "Overall Packet Statistics" in plugin_traffic:
         overall_base = base_traffic["Overall Packet Statistics"]
         overall_plugin = plugin_traffic["Overall Packet Statistics"]
-        overall_diff = {k: overall_plugin.get(k, 0) - overall_base.get(k, 0)
-                        for k in set(overall_base) | set(overall_plugin)}
+        
+        # Правильный расчет разницы статистик (только положительные значения)
+        overall_diff = {}
+        for k in set(overall_base) | set(overall_plugin):
+            plugin_value = overall_plugin.get(k, 0)
+            base_value = overall_base.get(k, 0)
+            diff = plugin_value - base_value
+            if diff > 0:  # Учитываем только положительные значения
+                overall_diff[k] = diff
+        
         unique_traffic["Overall Packet Statistics"] = overall_diff
     else:
         unique_traffic["Overall Packet Statistics"] = plugin_traffic.get("Overall Packet Statistics", {})
@@ -124,7 +169,7 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
     ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
     sorted_ips = sorted(ip_keys, key=ip_sort_key)
     
-    template_str = """
+    template_str = r"""
     <!DOCTYPE html>
     <html lang="ru">
     <head>
@@ -139,6 +184,11 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                 padding: 20px;
                 color: #333;
                 background-color: #f5f5f5;
+            }
+            @keyframes highlight {
+                0% { background-color: rgba(52, 152, 219, 0.4); }
+                50% { background-color: rgba(52, 152, 219, 0.7); }
+                100% { background-color: transparent; }
             }
             .container {
                 max-width: 1200px;
@@ -329,6 +379,90 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                 margin-bottom: 5px;
                 display: inline-block;
             }
+            .copyable {
+                cursor: pointer;
+                position: relative;
+                display: inline-block;
+                padding: 2px 5px;
+                background-color: rgba(240, 240, 240, 0.5);
+                border-radius: 3px;
+                margin-right: 5px;
+                font-weight: bold;
+                color: inherit;
+                border: 1px solid #ddd;
+            }
+            .copyable:hover {
+                background-color: #e0e0e0;
+            }
+            .copyable::after {
+                content: 'Скопировано!';
+                position: absolute;
+                top: -30px;
+                left: 50%;
+                transform: translateX(-50%);
+                background-color: #333;
+                color: white;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                opacity: 0;
+                transition: opacity 0.3s;
+                pointer-events: none;
+                white-space: nowrap;
+            }
+            .copyable.copied::after {
+                opacity: 1;
+            }
+            .connection-link {
+                padding: 2px 6px;
+                margin: 2px;
+                display: inline-block;
+                border-radius: 4px;
+                background-color: #f5f5f5;
+                border: 1px solid #ddd;
+                cursor: pointer;
+                text-decoration: none !important;
+            }
+            .connection-link.outgoing {
+                background-color: #e8f4f8;
+                border-color: #c5e0e8;
+            }
+            .connection-link.incoming {
+                background-color: #f8f4e8;
+                border-color: #e8d5c5;
+            }
+            .connection-link:hover {
+                background-color: #e0e0e0;
+            }
+            .connections-container {
+                margin-top: 10px;
+                padding: 10px;
+                background-color: #f9f9f9;
+                border-radius: 5px;
+            }
+            .http-detail {
+                margin-top: 5px;
+                font-family: monospace;
+                word-break: break-all;
+            }
+            .usage-tips {
+                background-color: #f8f9fa;
+                border-left: 4px solid #3498db;
+                padding: 10px 15px;
+                margin-bottom: 20px;
+                border-radius: 4px;
+                font-size: 0.9em;
+            }
+            .usage-tips p {
+                margin-top: 0;
+                margin-bottom: 5px;
+                color: #2c3e50;
+            }
+            .usage-tips ul {
+                margin-top: 5px;
+                margin-bottom: 5px;
+                padding-left: 25px;
+            }
         </style>
     </head>
     <body>
@@ -336,6 +470,14 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
             <div class="header-info">
                 <h1>Отчет по анализу сетевого трафика</h1>
                 <span class="timestamp">Сгенерирован: {{ timestamp }}</span>
+            </div>
+            
+            <div class="usage-tips">
+                <p><strong>Подсказки:</strong></p>
+                <ul>
+                    <li>Нажмите на IP-адрес для перехода к его подробному отчету</li>
+                    <li>Щелкните на выделенный фоном IP-адрес, чтобы скопировать его в буфер обмена</li>
+                </ul>
             </div>
             
             <!-- Общая статистика по пакетам (раскрывающийся блок) -->
@@ -373,10 +515,11 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                 {% set is_blacklisted, threat_level, threat_score = get_threat_info_for_ip(ip, data) %}
                 
                 <button class="ip-collapsible {% if is_blacklisted %}blacklisted{% endif %}" onclick="toggleIP('ip_{{ ip|replace('.', '_') }}')">
+                    <span class="copyable" onclick="copyToClipboard(event, '{{ ip }}')">{{ ip }}</span>
                     {% if is_blacklisted %}
-                        {{ ip }} - В черном списке ({{ threat_level }}: {{ threat_score }})
+                        - В черном списке ({{ threat_level }}: {{ threat_score }})
                     {% else %}
-                        {{ ip }} - {{ ip_data.get('ASN', 'Не доступно') }}
+                        - {{ ip_data.get('ASN', 'Не доступно') }}
                     {% endif %}
                     <span class="toggle-icon">+</span>
                 </button>
@@ -395,6 +538,51 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                     <div class="section-title">
                         <h3>ASN</h3>
                         <p>{{ ip_data.get('ASN', 'Не доступно') }}</p>
+                    </div>
+                    
+                    <!-- Связи с другими IP -->
+                    <div class="section-title">
+                        <h3>Связи с другими IP-адресами</h3>
+                        <div class="connections-container">
+                            <div>
+                                <h4>Исходящие соединения:</h4>
+                                {% if ip_data.get('Connections', {}).get('Outgoing') %}
+                                    {% for connected_ip in ip_data.get('Connections', {}).get('Outgoing', []) %}
+                                        {% set ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(connected_ip, data) %}
+                                        <a href="javascript:void(0)" class="connection-link outgoing {% if ip_blacklisted %}threat-ip{% endif %}" 
+                                           onclick="scrollToIP('{{ connected_ip }}')">
+                                            <span class="copyable" onclick="copyToClipboard(event, '{{ connected_ip }}')">{{ connected_ip }}</span>
+                                            {% if ip_blacklisted %}
+                                                <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
+                                                    {{ ip_threat_score }}
+                                                </span>
+                                            {% endif %}
+                                        </a>
+                                    {% endfor %}
+                                {% else %}
+                                    <p>Нет исходящих соединений</p>
+                                {% endif %}
+                            </div>
+                            <div>
+                                <h4>Входящие соединения:</h4>
+                                {% if ip_data.get('Connections', {}).get('Incoming') %}
+                                    {% for connected_ip in ip_data.get('Connections', {}).get('Incoming', []) %}
+                                        {% set ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(connected_ip, data) %}
+                                        <a href="javascript:void(0)" class="connection-link incoming {% if ip_blacklisted %}threat-ip{% endif %}" 
+                                           onclick="scrollToIP('{{ connected_ip }}')">
+                                            <span class="copyable" onclick="copyToClipboard(event, '{{ connected_ip }}')">{{ connected_ip }}</span>
+                                            {% if ip_blacklisted %}
+                                                <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
+                                                    {{ ip_threat_score }}
+                                                </span>
+                                            {% endif %}
+                                        </a>
+                                    {% endfor %}
+                                {% else %}
+                                    <p>Нет входящих соединений</p>
+                                {% endif %}
+                            </div>
+                        </div>
                     </div>
                     
                     <!-- DNS ассоциации -->
@@ -417,12 +605,16 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                             <button class="collapsible">
                                 {% set is_server_blacklisted, server_threat_level, server_threat_score = get_threat_info_for_ip(server, data) %}
                                 {% if is_server_blacklisted %}
-                                    <span class="threat-ip">Сервер {{ server }}</span>
+                                    <span class="threat-ip">Сервер 
+                                        <span class="copyable" onclick="copyToClipboard(event, '{{ server }}')">{{ server }}</span>
+                                    </span>
                                     <span class="threat-badge {{ get_threat_badge_class(server_threat_level) }}">
                                         {{ server_threat_score }}
                                     </span>
                                 {% else %}
-                                    <span class="safe-ip">Сервер {{ server }}</span>
+                                    <span class="safe-ip">Сервер 
+                                        <span class="copyable" onclick="copyToClipboard(event, '{{ server }}')">{{ server }}</span>
+                                    </span>
                                 {% endif %}
                                 <span class="toggle-icon">+</span>
                             </button>
@@ -460,12 +652,16 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                                                 {% set resolved_ip = resolved_ip.strip() %}
                                                 {% set is_ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(resolved_ip, data) %}
                                                 {% if is_ip_blacklisted %}
-                                                    <span class="threat-ip">{{ resolved_ip }}</span>
+                                                    <span class="threat-ip">
+                                                        <span class="copyable" onclick="copyToClipboard(event, '{{ resolved_ip }}')">{{ resolved_ip }}</span>
+                                                    </span>
                                                     <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
                                                         {{ ip_threat_score }}
                                                     </span>
                                                 {% else %}
-                                                    <span class="safe-ip">{{ resolved_ip }}</span>
+                                                    <span class="safe-ip">
+                                                        <span class="copyable" onclick="copyToClipboard(event, '{{ resolved_ip }}')">{{ resolved_ip }}</span>
+                                                    </span>
                                                 {% endif %}
                                                 {% if not loop.last %}, {% endif %}
                                             {% endfor %}
@@ -551,7 +747,31 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                             <div><strong>{{ req.get('method', '') }} {{ req.get('uri', '') }} {{ req.get('version', '') }}</strong></div>
                             <div>Host: {{ req.get('host', '') }}</div>
                             {% if req.get('user_agent') %}
-                            <div>User-Agent: {{ req.get('user_agent', '') }}</div>
+                            <div class="http-detail">User-Agent: {{ req.get('user_agent', '') }}</div>
+                            {% endif %}
+                            {% if req.get('content_type') %}
+                            <div class="http-detail">Content-Type: {{ req.get('content_type', '') }}</div>
+                            {% endif %}
+                            {% if req.get('content_length') %}
+                            <div class="http-detail">Content-Length: {{ req.get('content_length', '') }}</div>
+                            {% endif %}
+                            {% if req.get('referer') %}
+                            <div class="http-detail">Referer: {{ req.get('referer', '') }}</div>
+                            {% endif %}
+                            {% if req.get('authorization') %}
+                            <div class="http-detail">Authorization: {{ req.get('authorization', '') }}</div>
+                            {% endif %}
+                            {% if req.get('origin') %}
+                            <div class="http-detail">Origin: {{ req.get('origin', '') }}</div>
+                            {% endif %}
+                            {% if req.get('cookies') %}
+                            <div class="http-detail">Cookies: {{ req.get('cookies', '') }}</div>
+                            {% endif %}
+                            {% if req.get('body') %}
+                            <div class="http-detail">
+                                <strong>Body:</strong>
+                                <pre>{{ req.get('body', '') }}</pre>
+                            </div>
                             {% endif %}
                             {% if req.get('host') and req.get('uri') %}
                             <div class="uri-link">
@@ -614,6 +834,55 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
                         if (icon) icon.textContent = "-";
                     }
                 });
+            }
+            
+            // Функция копирования в буфер обмена
+            function copyToClipboard(event, text) {
+                event.stopPropagation();
+                
+                navigator.clipboard.writeText(text).then(function() {
+                    var target = event.currentTarget;
+                    target.classList.add('copied');
+                    
+                    setTimeout(function() {
+                        target.classList.remove('copied');
+                    }, 1500);
+                }).catch(function(err) {
+                    console.error('Не удалось скопировать текст: ', err);
+                });
+                
+                // Предотвращаем выполнение других обработчиков
+                return false;
+            }
+            
+            // Функция для прокрутки к IP-адресу
+            function scrollToIP(ip) {
+                var ipElements = document.querySelectorAll('.ip-collapsible');
+                for (var i = 0; i < ipElements.length; i++) {
+                    if (ipElements[i].textContent.includes(ip)) {
+                        // Прокручиваем к элементу
+                        ipElements[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        
+                        // Мигаем фоном для привлечения внимания
+                        ipElements[i].style.animation = 'highlight 2s';
+                        ipElements[i].style.boxShadow = '0 0 15px #3498db';
+                        
+                        setTimeout(function(elem) {
+                            return function() {
+                                elem.style.boxShadow = '';
+                                elem.style.animation = '';
+                            };
+                        }(ipElements[i]), 2000);
+                        
+                        // Открываем содержимое, если оно закрыто
+                        var ipId = 'ip_' + ip.replace(/\./g, '_');
+                        var content = document.getElementById(ipId);
+                        if (content && !content.style.maxHeight) {
+                            toggleIP(ipId);
+                        }
+                        break;
+                    }
+                }
             }
             
             // Автоматически открыть первую секцию при загрузке

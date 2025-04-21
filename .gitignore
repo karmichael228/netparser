@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+venv/
+*.log
+*.html
+*.json
+*.csv
+*.xlsx

@@ -264,6 +264,7 @@ class NetParser:
             "http_count": 0,
             "https_count": 0,
             "dns_count": 0,
+            "other_count": 0,
             "total_bytes": 0
         }
         self.data_lock = threading.Lock()
@@ -272,6 +273,10 @@ class NetParser:
         self.check_blacklists = check_blacklists
         self.ip_blacklist = IpsumBlacklist() if check_blacklists else None
         self.ip_threat_info: Dict[str, Tuple[bool, int]] = {}  # Информация о угрозе {ip: (в_черном_списке, счетчик)}
+        # Связи между IP адресами (src -> dst)
+        self.ip_connections: Dict[str, Set[str]] = {}
+        # Обратные связи (dst -> src)
+        self.ip_reverse_connections: Dict[str, Set[str]] = {}
 
     def _get_or_create_set(self, d: Dict[str, Set[str]], key: str) -> Set[str]:
         """Получает существующий Set или создает новый."""
@@ -350,15 +355,21 @@ class NetParser:
             return None
 
     def handle_tls_pkt(self, pkt: Packet) -> None:
-        """Обрабатывает TLS пакет и извлекает SNI."""
+        """Обрабатывает TLS пакет и извлекает SNI, независимо от порта."""
         try:
-            if TCP in pkt and pkt[TCP].dport == 443 and pkt.haslayer(Raw):
+            if TCP in pkt and pkt.haslayer(Raw):
                 raw_payload = pkt[Raw].load
                 sni = self.extract_sni_from_tls(raw_payload)
                 if sni:
                     ip = self._normalize_ipv4(pkt[IP].dst) if IP in pkt else '<UNKNOWN>'
                     with self.data_lock:
                         self._get_or_create_set(self.sni_by_ip, ip).add(sni)
+                        # Обновляем счетчик HTTPS пакетов
+                        self.packet_statistics["https_count"] += 1
+                        src_stats = self._get_or_create_int_dict(self.output_data, self._normalize_ipv4(pkt[IP].src))
+                        dst_stats = self._get_or_create_int_dict(self.output_data, ip)
+                        src_stats["https_count"] = src_stats.get("https_count", 0) + 1
+                        dst_stats["https_count"] = dst_stats.get("https_count", 0) + 1
         except Exception as e:
             self.logger.debug(f"Error processing TLS packet: {str(e)}")
 
@@ -566,59 +577,190 @@ class NetParser:
                     
                     with self.data_lock:
                         self.ip_list_conn.update([ip_src, ip_dst])
+                        
+                        # Обновляем связи между IP адресами
+                        self._get_or_create_set(self.ip_connections, ip_src).add(ip_dst)
+                        self._get_or_create_set(self.ip_reverse_connections, ip_dst).add(ip_src)
+                        
                         src_stats = self._get_or_create_int_dict(self.output_data, ip_src)
                         dst_stats = self._get_or_create_int_dict(self.output_data, ip_dst)
                         src_stats["packets_out"] = src_stats.get("packets_out", 0) + 1
                         src_stats["bytes_out"] = src_stats.get("bytes_out", 0) + len(pkt)
                         dst_stats["packets_in"] = dst_stats.get("packets_in", 0) + 1
                         dst_stats["bytes_in"] = dst_stats.get("bytes_in", 0) + len(pkt)
+                    
+                    protocol_detected = False
+                    
                     if TCP in pkt:
                         with self.data_lock:
                             self.packet_statistics["tcp_count"] += 1
                             src_stats["tcp_count"] = src_stats.get("tcp_count", 0) + 1
                             dst_stats["tcp_count"] = dst_stats.get("tcp_count", 0) + 1
+                        
+                        protocol_detected = True
+                        
                         if pkt[TCP].dport == 80 and pkt.haslayer(Raw):
                             with self.data_lock:
                                 self.packet_statistics["http_count"] += 1
+                                src_stats["http_count"] = src_stats.get("http_count", 0) + 1
+                                dst_stats["http_count"] = dst_stats.get("http_count", 0) + 1
                             try:
                                 raw_payload = pkt[Raw].load.decode('utf-8', errors='ignore')
-                                host_match = re.search(r"Host:\s*([^\r\n]+)", raw_payload, re.IGNORECASE)
-                                if host_match:
-                                    with self.data_lock:
-                                        self._get_or_create_set(self.http_domains, ip_dst).add(host_match.group(1).strip())
-                                http_data = self.parse_http_request(raw_payload)
-                                if http_data:
-                                    with self.data_lock:
-                                        self._get_or_create_list(self.http_requests, ip_dst).append(http_data)
+                                # Улучшенный парсинг HTTP запросов
+                                self.parse_and_process_http(raw_payload, ip_src, ip_dst, pkt)
                             except Exception as e:
                                 self.logger.debug(f"Error processing HTTP request: {str(e)}")
-                        elif pkt[TCP].dport == 443:
-                            with self.data_lock:
-                                self.packet_statistics["https_count"] += 1
+                        
+                        # Проверяем TLS-рукопожатие на любом порту
+                        if pkt.haslayer(Raw):
                             self.handle_tls_pkt(pkt)
+                    
                     elif UDP in pkt:
                         with self.data_lock:
                             self.packet_statistics["udp_count"] += 1
                             src_stats["udp_count"] = src_stats.get("udp_count", 0) + 1
                             dst_stats["udp_count"] = dst_stats.get("udp_count", 0) + 1
+                        
+                        protocol_detected = True
+                        
                         if ICMP in pkt:
                             with self.data_lock:
                                 self.packet_statistics["icmp_count"] += 1
                                 src_stats["icmp_count"] = src_stats.get("icmp_count", 0) + 1
                                 dst_stats["icmp_count"] = dst_stats.get("icmp_count", 0) + 1
+                    
                     if DNS in pkt:
                         with self.data_lock:
                             self.packet_statistics["dns_count"] += 1
                             src_stats["dns_count"] = src_stats.get("dns_count", 0) + 1
                             dst_stats["dns_count"] = dst_stats.get("dns_count", 0) + 1
+                        
+                        protocol_detected = True
                         self.handle_dns_pkt(pkt)
+                    
+                    # Если ни один из известных протоколов не обнаружен, считаем как other
+                    if not protocol_detected:
+                        with self.data_lock:
+                            self.packet_statistics["other_count"] += 1
+                            src_stats["other_count"] = src_stats.get("other_count", 0) + 1
+                            dst_stats["other_count"] = dst_stats.get("other_count", 0) + 1
+            
             except Exception as e:
                 self.logger.debug(f"Error processing packet: {str(e)}")
                 continue
 
+    def parse_and_process_http(self, payload: str, ip_src: str, ip_dst: str, pkt: Packet) -> None:
+        """Расширенный парсинг HTTP-запросов с детальным анализом заголовков и содержимого."""
+        try:
+            lines = payload.splitlines()
+            if not lines:
+                return None
+            
+            # Улучшенное регулярное выражение для REQUEST LINE
+            request_line_pattern = re.compile(r"^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT|TRACE)\s+(\S+)\s+(HTTP/\d\.\d)")
+            match = request_line_pattern.match(lines[0])
+            
+            if match:
+                # Это HTTP запрос
+                http_data = {
+                    "method": match.group(1),
+                    "uri": match.group(2),
+                    "version": match.group(3),
+                    "host": "",
+                    "user_agent": "",
+                    "content_type": "",
+                    "content_length": "",
+                    "referer": "",
+                    "cookies": "",
+                    "authorization": "",
+                    "origin": "",
+                    "x_requested_with": ""
+                }
+                
+                # Парсинг заголовков
+                headers_section_ended = False
+                body = []
+                
+                for line in lines[1:]:
+                    line = line.strip()
+                    if not line and not headers_section_ended:
+                        headers_section_ended = True
+                        continue
+                    
+                    if headers_section_ended:
+                        body.append(line)
+                        continue
+                    
+                    if ':' in line:
+                        header, value = line.split(":", 1)
+                        header = header.strip().lower()
+                        value = value.strip()
+                        
+                        if header == "host":
+                            http_data["host"] = value
+                        elif header == "user-agent":
+                            http_data["user_agent"] = value
+                        elif header == "content-type":
+                            http_data["content_type"] = value
+                        elif header == "content-length":
+                            http_data["content_length"] = value
+                        elif header == "referer":
+                            http_data["referer"] = value
+                        elif header == "cookie":
+                            http_data["cookies"] = value
+                        elif header == "authorization":
+                            # Маскируем данные авторизации для безопасности
+                            if value.startswith("Basic"):
+                                http_data["authorization"] = "Basic [MASKED]"
+                            elif value.startswith("Bearer"):
+                                http_data["authorization"] = "Bearer [MASKED]"
+                            else:
+                                http_data["authorization"] = "[MASKED]"
+                        elif header == "origin":
+                            http_data["origin"] = value
+                        elif header == "x-requested-with":
+                            http_data["x_requested_with"] = value
+                
+                # Добавляем тело запроса, если есть POST или PUT и Content-Length > 0
+                if (http_data["method"] in ["POST", "PUT"]) and body and http_data.get("content_length"):
+                    try:
+                        content_length = int(http_data["content_length"])
+                        if content_length > 0:
+                            body_content = "\n".join(body)
+                            # Маскируем потенциально чувствительные данные в теле запроса
+                            if "password" in body_content.lower() or "token" in body_content.lower():
+                                http_data["body"] = "[SENSITIVE CONTENT MASKED]"
+                            else:
+                                # Ограничиваем размер сохраняемого тела запроса
+                                max_body_length = 1024  # Максимальная длина тела запроса для сохранения
+                                if len(body_content) > max_body_length:
+                                    http_data["body"] = body_content[:max_body_length] + "... [TRUNCATED]"
+                                else:
+                                    http_data["body"] = body_content
+                    except ValueError:
+                        pass
+                
+                # Сохраняем HTTP запрос
+                with self.data_lock:
+                    if http_data["host"]:
+                        self._get_or_create_set(self.http_domains, ip_dst).add(http_data["host"])
+                    self._get_or_create_list(self.http_requests, ip_dst).append(http_data)
+            
+            # Проверяем, не является ли это HTTP ответом
+            response_line_pattern = re.compile(r"^(HTTP/\d\.\d)\s+(\d+)\s+(.+)$")
+            match = response_line_pattern.match(lines[0])
+            
+            if match and not http_data.get("method"):
+                # Это HTTP ответ, можно также обрабатывать их при необходимости
+                pass
+                
+        except Exception as e:
+            self.logger.debug(f"Error in parse_and_process_http: {str(e)}")
+            return None
+
     def process_in_parallel(self, pcap_file: str,
-                            num_threads: int = 4,
-                            filters: Optional[Callable[[Packet], bool]] = None) -> None:
+                           num_threads: int = 4,
+                           filters: Optional[Callable[[Packet], bool]] = None) -> None:
         def packet_iterator() -> Generator[Packet, None, None]:
             try:
                 with PcapReader(pcap_file) as reader:
@@ -632,6 +774,7 @@ class NetParser:
         chunk_size = 1000
         futures = []
         chunk: List[Packet] = []
+        self.logger.info(f"[*] Используется {num_threads} потоков для обработки")
         executor = ThreadPoolExecutor(max_workers=num_threads)
         try:
             for packet in tqdm(packet_iterator(), desc="Reading packets", unit="pkt"):
@@ -650,10 +793,11 @@ class NetParser:
             executor.shutdown()
 
     def analyze(self, pcap_file: str,
-                filters: Optional[Callable[[Packet], bool]] = None) -> Dict[str, Any]:
+                filters: Optional[Callable[[Packet], bool]] = None,
+                num_threads: int = 4) -> Dict[str, Any]:
         self.logger.info("[*] Starting PCAP analysis...")
         try:
-            self.process_in_parallel(pcap_file, filters=filters)
+            self.process_in_parallel(pcap_file, num_threads=num_threads, filters=filters)
             return self.output_data
         except Exception as e:
             self.logger.error(f"Analysis failed: {str(e)}")
@@ -684,6 +828,10 @@ class NetParser:
                     is_blacklisted, threat_score = False, 0
                     if self.check_blacklists:
                         is_blacklisted, threat_score = self.ip_threat_info.get(ip_norm, (False, 0))
+                    
+                    # Получаем связи с другими IP
+                    outgoing_connections = sorted(list(self.ip_connections.get(ip_norm, set())), key=self._ip_sort_key)
+                    incoming_connections = sorted(list(self.ip_reverse_connections.get(ip_norm, set())), key=self._ip_sort_key)
                 
                 # Обработка DNS ответов
                 if dns_resps:
@@ -739,7 +887,7 @@ class NetParser:
                     http_reqs = self.http_requests.get(ip_norm, [])
                 unique_reqs = {}
                 for req in http_reqs:
-                    key = tuple(sorted(req.items()))
+                    key = tuple(sorted((k, v) for k, v in req.items() if v))
                     unique_reqs.setdefault(key, req)
                 unique_http_reqs = list(unique_reqs.values())
 
@@ -758,7 +906,11 @@ class NetParser:
                     "HTTP Domains": http_hosts,
                     "HTTP Requests": unique_http_reqs,
                     "Traffic": traffic_stats,
-                    "Protocols": protocol_stats
+                    "Protocols": protocol_stats,
+                    "Connections": {
+                        "Outgoing": outgoing_connections,
+                        "Incoming": incoming_connections
+                    }
                 }
                 
                 # Добавляем информацию о наличии в черных списках
@@ -789,6 +941,10 @@ class NetParser:
                                 "HTTP Requests": [],
                                 "Traffic": {},
                                 "Protocols": {},
+                                "Connections": {
+                                    "Outgoing": [],
+                                    "Incoming": []
+                                },
                                 "Threat Info": {
                                     "is_blacklisted": is_blacklisted,
                                     "threat_score": threat_score,
