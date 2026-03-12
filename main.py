@@ -2,7 +2,8 @@
 import argparse
 import sys
 import os
-from utils import compare_traffic, generate_report, generate_html_report, print_report, generate_txt_report
+import multiprocessing
+from utils import compare_traffic, generate_report, print_report, generate_txt_report, generate_simple_html_report
 from netparser import NetParser
 
 
@@ -23,19 +24,24 @@ def main() -> None:
     """
     Основная функция, осуществляющая разбор аргументов командной строки и запуск анализа/сравнения PCAP-файлов.
     """
+    # Определяем оптимальное количество потоков
+    cpu_count = multiprocessing.cpu_count()
+    default_threads = max(1, min(cpu_count - 1, 8))  # Оставляем как минимум 1 ядро для ОС и не более 8 потоков
+    
     parser = argparse.ArgumentParser(
         description="Анализатор сетевого трафика для обнаружения подозрительной активности",
-        epilog="Пример: %(prog)s capture.pcap --html report.html --check-blacklists"
+        epilog="Пример: %(prog)s capture.pcap --json report.json --html report.html --check-blacklists"
     )
     parser.add_argument("pcap_file", help="Путь к PCAP файлу для анализа")
     parser.add_argument("--filter", help="Выражение фильтра пакетов (пример: DNS, IP, HTTP и т.д.)")
-    parser.add_argument("--html", metavar="HTML_PATH", help="Сгенерировать HTML отчет по указанному пути")
     parser.add_argument("--json", metavar="JSON_PATH", help="Сгенерировать JSON отчет по указанному пути")
+    parser.add_argument("--html", metavar="HTML_PATH", help="Сгенерировать простой HTML отчет по указанному пути")
     parser.add_argument("--compare", metavar="COMPARE_FILE", help="Путь ко второму PCAP файлу для сравнения")
     parser.add_argument("--txt", metavar="TXT_PATH", help="Сгенерировать TXT отчет по указанному пути")
     parser.add_argument("--check-blacklists", action="store_true", help="Проверять IP адреса по черным спискам")
     parser.add_argument("--no-check-blacklists", action="store_false", dest="check_blacklists", help="Не проверять IP адреса по черным спискам")
-    parser.add_argument("--threads", type=int, default=4, help="Количество потоков для обработки (по умолчанию: 4)")
+    parser.add_argument("--threads", type=int, default=default_threads, 
+                        help=f"Количество потоков для обработки (по умолчанию: {default_threads}, автоматически определено)")
     parser.add_argument("--debug", action="store_true", help="Включить подробный вывод отладочной информации")
     parser.set_defaults(check_blacklists=True)
     
@@ -50,6 +56,7 @@ def main() -> None:
 
     try:
         print(f"[*] Начинаем анализ PCAP-файла: {args.pcap_file}")
+        print(f"[*] Используется {args.threads} потоков из {cpu_count} доступных ядер CPU")
         
         if args.check_blacklists:
             print("[*] Проверка IP-адресов по черным спискам включена")
@@ -61,7 +68,8 @@ def main() -> None:
             if args.json:
                 generate_report(args.json, unique_traffic)
             if args.html:
-                generate_html_report(args.html, unique_traffic)
+                generate_simple_html_report(args.html, unique_traffic, title="NetParser Compare Report")
+                print(f"[*] HTML отчет сохранен в: {args.html}")
             if args.txt:
                 generate_txt_report(args.txt, unique_traffic)
         else:
@@ -80,7 +88,7 @@ def main() -> None:
                 generate_report(args.json, report_data)
                 print(f"[*] JSON отчет сохранен в: {args.json}")
             if args.html:
-                generate_html_report(args.html, report_data)
+                generate_simple_html_report(args.html, report_data, title="NetParser Analysis Report")
                 print(f"[*] HTML отчет сохранен в: {args.html}")
             if args.txt:
                 generate_txt_report(args.txt, report_data)

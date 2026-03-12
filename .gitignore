@@ -10,3 +10,17 @@ venv/
 *.json
 *.csv
 *.xlsx
+*.pcap
+*.pcapng
+*.pcapng.gz
+*.pcapng.bz2
+*.pcapng.xz
+*.pcapng.lzma
+*.pcapng.lz
+*.pcapng.lzo
+*.pcapng.lz4
+*.pcapng.zstd
+*.pcapng.zlib
+*.pcapng.zlib.gz
+*.pcapng.zlib.bz2
+.DS_Store

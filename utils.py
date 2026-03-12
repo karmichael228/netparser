@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import re
+import os
+import html
 from typing import Any, Dict, List, Tuple, Optional, Set
 from jinja2 import Template
 try:
@@ -39,6 +41,10 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
         is_blacklisted, threat_score = ip_blacklist.check_ip(ip)
         
         if not base_data:
+            # Это новый IP адрес, помечаем его
+            plugin_data = dict(plugin_data)  # Создаем копию, чтобы не изменять оригинал
+            plugin_data["is_new"] = True  # Специальная метка для новых IP
+            
             unique_traffic[ip] = plugin_data
             if "Threat Info" not in plugin_data and is_blacklisted:
                 threat_info = {
@@ -112,26 +118,36 @@ def compare_traffic(pcap_base_file: str, pcap_plugin_file: str) -> Dict[str, Any
                 if diff > 0:  # Учитываем только положительные значения
                     unique_traffic_stats[key] = diff
             
-            unique_traffic[ip] = {
-                "ASN": unique_asn if unique_asn else base_data["ASN"],
-                "DNS Associations": sorted(unique_dns),
-                "DNS Queries by Server": unique_dns_queries_by_server if unique_dns_queries_by_server else None,
-                "DNS Responses": plugin_data.get("DNS Responses", []),
-                "DNS Resolution Chains": plugin_data.get("DNS Resolution Chains", []),
-                "SNI Records": sorted(unique_sni),
-                "HTTP Domains": sorted(unique_http_domains),
-                "HTTP Requests": unique_http_reqs,
-                "Traffic": unique_traffic_stats,
-                "Protocols": unique_protocols,
-                "Connections": {
-                    "Outgoing": sorted(unique_outgoing, key=ip_sort_key),
-                    "Incoming": sorted(unique_incoming, key=ip_sort_key)
-                }
-            }
+            # Проверяем, есть ли вообще уникальные данные для этого IP
+            has_unique_data = (
+                unique_dns or unique_sni or unique_http_domains or unique_http_reqs or
+                unique_asn or unique_protocols or unique_dns_queries_by_server or
+                unique_outgoing or unique_incoming or unique_traffic_stats
+            )
             
-            # Добавляем информацию о угрозе, если IP в черном списке
-            if threat_info:
-                unique_traffic[ip]["Threat Info"] = threat_info
+            # Добавляем IP только если есть уникальные данные
+            if has_unique_data:
+                unique_traffic[ip] = {
+                    "ASN": unique_asn if unique_asn else base_data["ASN"],
+                    "is_new": False,  # Это существующий IP с новыми данными
+                    "DNS Associations": sorted(unique_dns),
+                    "DNS Queries by Server": unique_dns_queries_by_server if unique_dns_queries_by_server else None,
+                    "DNS Responses": plugin_data.get("DNS Responses", []),
+                    "DNS Resolution Chains": plugin_data.get("DNS Resolution Chains", []),
+                    "SNI Records": sorted(unique_sni),
+                    "HTTP Domains": sorted(unique_http_domains),
+                    "HTTP Requests": unique_http_reqs,
+                    "Traffic": unique_traffic_stats,
+                    "Protocols": unique_protocols,
+                    "Connections": {
+                        "Outgoing": sorted(unique_outgoing, key=ip_sort_key),
+                        "Incoming": sorted(unique_incoming, key=ip_sort_key)
+                    }
+                }
+                
+                # Добавляем информацию о угрозе, если IP в черном списке
+                if threat_info:
+                    unique_traffic[ip]["Threat Info"] = threat_info
 
     if "Overall Packet Statistics" in base_traffic and "Overall Packet Statistics" in plugin_traffic:
         overall_base = base_traffic["Overall Packet Statistics"]
@@ -169,730 +185,32 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
     ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
     sorted_ips = sorted(ip_keys, key=ip_sort_key)
     
-    template_str = r"""
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Отчет по анализу сетевого трафика</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                line-height: 1.6;
-                margin: 0;
-                padding: 20px;
-                color: #333;
-                background-color: #f5f5f5;
-            }
-            @keyframes highlight {
-                0% { background-color: rgba(52, 152, 219, 0.4); }
-                50% { background-color: rgba(52, 152, 219, 0.7); }
-                100% { background-color: transparent; }
-            }
-            .container {
-                max-width: 1200px;
-                margin: 0 auto;
-                background-color: #fff;
-                padding: 20px;
-                border-radius: 8px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            }
-            h1, h2, h3 {
-                color: #2c3e50;
-            }
-            h1 {
-                text-align: center;
-                border-bottom: 2px solid #eee;
-                padding-bottom: 10px;
-                margin-bottom: 20px;
-            }
-            .stats-container, .ip-container {
-                margin-bottom: 20px;
-                padding: 15px;
-                background-color: #f9f9f9;
-                border-radius: 5px;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-bottom: 20px;
-            }
-            th, td {
-                padding: 12px 15px;
-                text-align: left;
-                border-bottom: 1px solid #ddd;
-            }
-            th {
-                background-color: #f2f2f2;
-                font-weight: bold;
-            }
-            tr:hover {
-                background-color: #f5f5f5;
-            }
-            .section-title {
-                margin-top: 20px;
-                padding-bottom: 5px;
-                border-bottom: 1px solid #eee;
-            }
-            .dns-response {
-                margin-bottom: 10px;
-                padding: 8px;
-                background-color: #f2f2f2;
-                border-radius: 4px;
-            }
-            .dns-response-name {
-                font-weight: bold;
-            }
-            .header-info {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-            }
-            .timestamp {
-                color: #777;
-                font-size: 0.9em;
-            }
-            .threat-ip {
-                color: #e74c3c;
-                font-weight: bold;
-            }
-            .safe-ip {
-                color: #2ecc71;
-                font-weight: bold;
-            }
-            .threat-badge {
-                display: inline-block;
-                padding: 3px 6px;
-                border-radius: 3px;
-                font-size: 0.8em;
-                font-weight: bold;
-                color: white;
-                margin-left: 5px;
-            }
-            .threat-low {
-                background-color: #f39c12;
-            }
-            .threat-medium {
-                background-color: #e67e22;
-            }
-            .threat-high {
-                background-color: #d35400;
-            }
-            .threat-critical {
-                background-color: #c0392b;
-            }
-            .collapsible {
-                background-color: #f9f9f9;
-                color: #444;
-                cursor: pointer;
-                padding: 18px;
-                width: 100%;
-                border: none;
-                text-align: left;
-                outline: none;
-                font-size: 15px;
-                border-radius: 5px;
-                margin-top: 5px;
-                transition: background-color 0.3s;
-            }
-            .active, .collapsible:hover {
-                background-color: #eee;
-            }
-            .content {
-                padding: 0 18px;
-                max-height: 0;
-                overflow: hidden;
-                transition: max-height 0.2s ease-out;
-                background-color: white;
-                border-radius: 0 0 5px 5px;
-            }
-            .toggle-icon {
-                float: right;
-                margin-left: 5px;
-            }
-            .section-collapsible {
-                background-color: #2c3e50;
-                color: white;
-                cursor: pointer;
-                padding: 18px;
-                width: 100%;
-                border: none;
-                text-align: left;
-                outline: none;
-                font-size: 18px;
-                border-radius: 5px;
-                margin: 10px 0;
-                transition: background-color 0.3s;
-            }
-            .section-collapsible:hover {
-                background-color: #34495e;
-            }
-            .ip-collapsible {
-                background-color: #2ecc71;
-                color: white;
-                cursor: pointer;
-                padding: 15px;
-                width: 100%;
-                border: none;
-                text-align: left;
-                outline: none;
-                font-size: 16px;
-                border-radius: 5px;
-                margin: 5px 0;
-                transition: background-color 0.3s;
-            }
-            .ip-collapsible.blacklisted {
-                background-color: #e74c3c;
-            }
-            .ip-collapsible:hover {
-                background-color: #27ae60;
-            }
-            .ip-collapsible.blacklisted:hover {
-                background-color: #c0392b;
-            }
-            .ip-content {
-                padding: 0 18px;
-                max-height: 0;
-                overflow: hidden;
-                transition: max-height 0.2s ease-out;
-                background-color: white;
-                border-radius: 0 0 5px 5px;
-                border: 1px solid #ddd;
-                border-top: none;
-            }
-            .chart-container {
-                position: relative;
-                margin: auto;
-                height: 300px;
-                width: 100%;
-            }
-            a {
-                color: #3498db;
-                text-decoration: none;
-            }
-            a:hover {
-                text-decoration: underline;
-            }
-            .uri-link {
-                margin-bottom: 5px;
-                display: inline-block;
-            }
-            .copyable {
-                cursor: pointer;
-                position: relative;
-                display: inline-block;
-                padding: 2px 5px;
-                background-color: rgba(240, 240, 240, 0.5);
-                border-radius: 3px;
-                margin-right: 5px;
-                font-weight: bold;
-                color: inherit;
-                border: 1px solid #ddd;
-            }
-            .copyable:hover {
-                background-color: #e0e0e0;
-            }
-            .copyable::after {
-                content: 'Скопировано!';
-                position: absolute;
-                top: -30px;
-                left: 50%;
-                transform: translateX(-50%);
-                background-color: #333;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-size: 12px;
-                opacity: 0;
-                transition: opacity 0.3s;
-                pointer-events: none;
-                white-space: nowrap;
-            }
-            .copyable.copied::after {
-                opacity: 1;
-            }
-            .connection-link {
-                padding: 2px 6px;
-                margin: 2px;
-                display: inline-block;
-                border-radius: 4px;
-                background-color: #f5f5f5;
-                border: 1px solid #ddd;
-                cursor: pointer;
-                text-decoration: none !important;
-            }
-            .connection-link.outgoing {
-                background-color: #e8f4f8;
-                border-color: #c5e0e8;
-            }
-            .connection-link.incoming {
-                background-color: #f8f4e8;
-                border-color: #e8d5c5;
-            }
-            .connection-link:hover {
-                background-color: #e0e0e0;
-            }
-            .connections-container {
-                margin-top: 10px;
-                padding: 10px;
-                background-color: #f9f9f9;
-                border-radius: 5px;
-            }
-            .http-detail {
-                margin-top: 5px;
-                font-family: monospace;
-                word-break: break-all;
-            }
-            .usage-tips {
-                background-color: #f8f9fa;
-                border-left: 4px solid #3498db;
-                padding: 10px 15px;
-                margin-bottom: 20px;
-                border-radius: 4px;
-                font-size: 0.9em;
-            }
-            .usage-tips p {
-                margin-top: 0;
-                margin-bottom: 5px;
-                color: #2c3e50;
-            }
-            .usage-tips ul {
-                margin-top: 5px;
-                margin-bottom: 5px;
-                padding-left: 25px;
-            }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header-info">
-                <h1>Отчет по анализу сетевого трафика</h1>
-                <span class="timestamp">Сгенерирован: {{ timestamp }}</span>
-            </div>
-            
-            <div class="usage-tips">
-                <p><strong>Подсказки:</strong></p>
-                <ul>
-                    <li>Нажмите на IP-адрес для перехода к его подробному отчету</li>
-                    <li>Щелкните на выделенный фоном IP-адрес, чтобы скопировать его в буфер обмена</li>
-                </ul>
-            </div>
-            
-            <!-- Общая статистика по пакетам (раскрывающийся блок) -->
-            <button class="section-collapsible" onclick="toggleSection('statsSection')">
-                Общая статистика по пакетам <span class="toggle-icon">+</span>
-            </button>
-            <div id="statsSection" class="content">
-                {% if stats %}
-                <div class="stats-container">
-                    <table>
-                        <tr>
-                            <th>Метрика</th>
-                            <th>Значение</th>
-                        </tr>
-                        {% for stat, value in stats.items() %}
-                        <tr>
-                            <td>{{ stat }}</td>
-                            <td>{{ value }}</td>
-                        </tr>
-                        {% endfor %}
-                    </table>
-                </div>
-                {% else %}
-                <p>Нет доступной статистики.</p>
-                {% endif %}
-            </div>
-            
-            <!-- IP адреса (раскрывающийся блок) -->
-            <button class="section-collapsible" onclick="toggleSection('ipSection')">
-                IP адреса ({{ sorted_ips|length }}) <span class="toggle-icon">+</span>
-            </button>
-            <div id="ipSection" class="content">
-                {% for ip in sorted_ips %}
-                {% set ip_data = data[ip] %}
-                {% set is_blacklisted, threat_level, threat_score = get_threat_info_for_ip(ip, data) %}
-                
-                <button class="ip-collapsible {% if is_blacklisted %}blacklisted{% endif %}" onclick="toggleIP('ip_{{ ip|replace('.', '_') }}')">
-                    <span class="copyable" onclick="copyToClipboard(event, '{{ ip }}')">{{ ip }}</span>
-                    {% if is_blacklisted %}
-                        - В черном списке ({{ threat_level }}: {{ threat_score }})
-                    {% else %}
-                        - {{ ip_data.get('ASN', 'Не доступно') }}
-                    {% endif %}
-                    <span class="toggle-icon">+</span>
-                </button>
-                <div id="ip_{{ ip|replace('.', '_') }}" class="ip-content">
-                    <!-- Информация об угрозе -->
-                    <div class="section-title">
-                        <h3>Информация об угрозе</h3>
-                        {% if is_blacklisted %}
-                            <p class="threat-ip">Статус: В черном списке - {{ threat_level }} ({{ threat_score }})</p>
-                        {% else %}
-                            <p class="safe-ip">Статус: Отсуствует в черном списке </p>
-                        {% endif %}
-                    </div>
-                    
-                    <!-- ASN -->
-                    <div class="section-title">
-                        <h3>ASN</h3>
-                        <p>{{ ip_data.get('ASN', 'Не доступно') }}</p>
-                    </div>
-                    
-                    <!-- Связи с другими IP -->
-                    <div class="section-title">
-                        <h3>Связи с другими IP-адресами</h3>
-                        <div class="connections-container">
-                            <div>
-                                <h4>Исходящие соединения:</h4>
-                                {% if ip_data.get('Connections', {}).get('Outgoing') %}
-                                    {% for connected_ip in ip_data.get('Connections', {}).get('Outgoing', []) %}
-                                        {% set ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(connected_ip, data) %}
-                                        <a href="javascript:void(0)" class="connection-link outgoing {% if ip_blacklisted %}threat-ip{% endif %}" 
-                                           onclick="scrollToIP('{{ connected_ip }}')">
-                                            <span class="copyable" onclick="copyToClipboard(event, '{{ connected_ip }}')">{{ connected_ip }}</span>
-                                            {% if ip_blacklisted %}
-                                                <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
-                                                    {{ ip_threat_score }}
-                                                </span>
-                                            {% endif %}
-                                        </a>
-                                    {% endfor %}
-                                {% else %}
-                                    <p>Нет исходящих соединений</p>
-                                {% endif %}
-                            </div>
-                            <div>
-                                <h4>Входящие соединения:</h4>
-                                {% if ip_data.get('Connections', {}).get('Incoming') %}
-                                    {% for connected_ip in ip_data.get('Connections', {}).get('Incoming', []) %}
-                                        {% set ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(connected_ip, data) %}
-                                        <a href="javascript:void(0)" class="connection-link incoming {% if ip_blacklisted %}threat-ip{% endif %}" 
-                                           onclick="scrollToIP('{{ connected_ip }}')">
-                                            <span class="copyable" onclick="copyToClipboard(event, '{{ connected_ip }}')">{{ connected_ip }}</span>
-                                            {% if ip_blacklisted %}
-                                                <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
-                                                    {{ ip_threat_score }}
-                                                </span>
-                                            {% endif %}
-                                        </a>
-                                    {% endfor %}
-                                {% else %}
-                                    <p>Нет входящих соединений</p>
-                                {% endif %}
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <!-- DNS ассоциации -->
-                    {% if ip_data.get('DNS Associations') %}
-                    <div class="section-title">
-                        <h3>DNS-разрешения</h3>
-                        <ul>
-                        {% for assoc in ip_data.get('DNS Associations', []) %}
-                            <li>{{ assoc }}</li>
-                        {% endfor %}
-                        </ul>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- DNS запросы по серверам -->
-                    {% if ip_data.get('DNS Queries by Server') %}
-                    <div class="section-title">
-                        <h3>DNS-запросы по серверу</h3>
-                        {% for server, queries in ip_data.get('DNS Queries by Server', {}).items() %}
-                            <button class="collapsible">
-                                {% set is_server_blacklisted, server_threat_level, server_threat_score = get_threat_info_for_ip(server, data) %}
-                                {% if is_server_blacklisted %}
-                                    <span class="threat-ip">Сервер 
-                                        <span class="copyable" onclick="copyToClipboard(event, '{{ server }}')">{{ server }}</span>
-                                    </span>
-                                    <span class="threat-badge {{ get_threat_badge_class(server_threat_level) }}">
-                                        {{ server_threat_score }}
-                                    </span>
-                                {% else %}
-                                    <span class="safe-ip">Сервер 
-                                        <span class="copyable" onclick="copyToClipboard(event, '{{ server }}')">{{ server }}</span>
-                                    </span>
-                                {% endif %}
-                                <span class="toggle-icon">+</span>
-                            </button>
-                            <div class="content">
-                                <ul>
-                                {% for query in queries %}
-                                    <li>{{ query }}</li>
-                                {% endfor %}
-                                </ul>
-                            </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                    
-                    <!-- DNS ответы (раскрывающийся блок) -->
-                    {% if ip_data.get('DNS Responses') %}
-                    <div class="section-title">
-                        <h3>DNS-ответы</h3>
-                        <button class="collapsible">Показать/скрыть DNS-ответы ({{ ip_data.get('DNS Responses')|length }}) <span class="toggle-icon">+</span></button>
-                        <div class="content">
-                            <table>
-                                <tr>
-                                    <th>Имя</th>
-                                    <th>Тип</th>
-                                    <th>Разрешение</th>
-                                </tr>
-                                {% for entry in ip_data.get('DNS Responses', []) %}
-                                <tr>
-                                    <td>{{ entry.name }}</td>
-                                    <td>{{ entry.type }}</td>
-                                    <td>
-                                        {% if entry.type == "A" %}
-                                            {% set ips = entry.resolution.split(',') %}
-                                            {% for resolved_ip in ips %}
-                                                {% set resolved_ip = resolved_ip.strip() %}
-                                                {% set is_ip_blacklisted, ip_threat_level, ip_threat_score = get_threat_info_for_ip(resolved_ip, data) %}
-                                                {% if is_ip_blacklisted %}
-                                                    <span class="threat-ip">
-                                                        <span class="copyable" onclick="copyToClipboard(event, '{{ resolved_ip }}')">{{ resolved_ip }}</span>
-                                                    </span>
-                                                    <span class="threat-badge {{ get_threat_badge_class(ip_threat_level) }}">
-                                                        {{ ip_threat_score }}
-                                                    </span>
-                                                {% else %}
-                                                    <span class="safe-ip">
-                                                        <span class="copyable" onclick="copyToClipboard(event, '{{ resolved_ip }}')">{{ resolved_ip }}</span>
-                                                    </span>
-                                                {% endif %}
-                                                {% if not loop.last %}, {% endif %}
-                                            {% endfor %}
-                                        {% else %}
-                                            {{ entry.resolution }}
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </table>
-                        </div>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- SNI записи -->
-                    {% if ip_data.get('SNI Records') %}
-                    <div class="section-title">
-                        <h3>SNI-записи</h3>
-                        <ul>
-                        {% for record in ip_data.get('SNI Records', []) %}
-                            <li>{{ record }}</li>
-                        {% endfor %}
-                        </ul>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- HTTP домены -->
-                    {% if ip_data.get('HTTP Domains') %}
-                    <div class="section-title">
-                        <h3>HTTP-домены</h3>
-                        <ul>
-                        {% for domain in ip_data.get('HTTP Domains', []) %}
-                            <li>{{ domain }}</li>
-                        {% endfor %}
-                        </ul>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- Трафик -->
-                    {% if ip_data.get('Traffic') %}
-                    <div class="section-title">
-                        <h3>Трафик</h3>
-                        <table>
-                            <tr>
-                                <th>Тип</th>
-                                <th>Размер</th>
-                            </tr>
-                            {% for traffic_type, size in ip_data.get('Traffic', {}).items() %}
-                            <tr>
-                                <td>{{ traffic_type.replace('_', ' ').title() }}</td>
-                                <td>{{ size }}</td>
-                            </tr>
-                            {% endfor %}
-                        </table>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- Протоколы -->
-                    {% if ip_data.get('Protocols') %}
-                    <div class="section-title">
-                        <h3>Протоколы</h3>
-                        <table>
-                            <tr>
-                                <th>Протокол</th>
-                                <th>Количество</th>
-                            </tr>
-                            {% for protocol, count in ip_data.get('Protocols', {}).items() %}
-                            <tr>
-                                <td>{{ protocol }}</td>
-                                <td>{{ count }}</td>
-                            </tr>
-                            {% endfor %}
-                        </table>
-                    </div>
-                    {% endif %}
-                    
-                    <!-- HTTP запросы и ссылки -->
-                    {% if ip_data.get('HTTP Requests') %}
-                    <div class="section-title">
-                        <h3>HTTP-запросы</h3>
-                        {% for req in ip_data.get('HTTP Requests', []) %}
-                        <div class="dns-response">
-                            <div><strong>{{ req.get('method', '') }} {{ req.get('uri', '') }} {{ req.get('version', '') }}</strong></div>
-                            <div>Host: {{ req.get('host', '') }}</div>
-                            {% if req.get('user_agent') %}
-                            <div class="http-detail">User-Agent: {{ req.get('user_agent', '') }}</div>
-                            {% endif %}
-                            {% if req.get('content_type') %}
-                            <div class="http-detail">Content-Type: {{ req.get('content_type', '') }}</div>
-                            {% endif %}
-                            {% if req.get('content_length') %}
-                            <div class="http-detail">Content-Length: {{ req.get('content_length', '') }}</div>
-                            {% endif %}
-                            {% if req.get('referer') %}
-                            <div class="http-detail">Referer: {{ req.get('referer', '') }}</div>
-                            {% endif %}
-                            {% if req.get('authorization') %}
-                            <div class="http-detail">Authorization: {{ req.get('authorization', '') }}</div>
-                            {% endif %}
-                            {% if req.get('origin') %}
-                            <div class="http-detail">Origin: {{ req.get('origin', '') }}</div>
-                            {% endif %}
-                            {% if req.get('cookies') %}
-                            <div class="http-detail">Cookies: {{ req.get('cookies', '') }}</div>
-                            {% endif %}
-                            {% if req.get('body') %}
-                            <div class="http-detail">
-                                <strong>Body:</strong>
-                                <pre>{{ req.get('body', '') }}</pre>
-                            </div>
-                            {% endif %}
-                            {% if req.get('host') and req.get('uri') %}
-                            <div class="uri-link">
-                                <a href="http://{{ req.get('host') }}{{ req.get('uri') }}" target="_blank">http://{{ req.get('host') }}{{ req.get('uri') }}</a>
-                            </div>
-                            {% endif %}
-                        </div>
-                        {% endfor %}
-                    </div>
-                    {% endif %}
-                </div>
-                {% endfor %}
-            </div>
-        </div>
+    # Подготовка данных для графа соединений
+    graph_nodes = set()
+    graph_edges = {}
+    
+    for ip in sorted_ips:
+        graph_nodes.add(ip)
         
-        <script>
-            // Функция для переключения раскрывающихся секций
-            function toggleSection(sectionId) {
-                var content = document.getElementById(sectionId);
-                var button = content.previousElementSibling;
-                var icon = button.querySelector(".toggle-icon");
-                
-                if (content.style.maxHeight) {
-                    content.style.maxHeight = null;
-                    icon.textContent = "+";
-                } else {
-                    content.style.maxHeight = "none";
-                    icon.textContent = "-";
-                }
-            }
-            
-            // Функция для переключения IP-информации
-            function toggleIP(ipId) {
-                var content = document.getElementById(ipId);
-                var button = content.previousElementSibling;
-                var icon = button.querySelector(".toggle-icon");
-                
-                if (content.style.maxHeight) {
-                    content.style.maxHeight = null;
-                    icon.textContent = "+";
-                } else {
-                    content.style.maxHeight = "none";
-                    icon.textContent = "-";
-                }
-            }
-            
-            // Обработчик для всех обычных коллапсов
-            var coll = document.getElementsByClassName("collapsible");
-            for (var i = 0; i < coll.length; i++) {
-                coll[i].addEventListener("click", function() {
-                    this.classList.toggle("active");
-                    var content = this.nextElementSibling;
-                    var icon = this.querySelector(".toggle-icon");
-                    
-                    if (content.style.maxHeight) {
-                        content.style.maxHeight = null;
-                        if (icon) icon.textContent = "+";
-                    } else {
-                        content.style.maxHeight = content.scrollHeight + "px";
-                        if (icon) icon.textContent = "-";
-                    }
-                });
-            }
-            
-            // Функция копирования в буфер обмена
-            function copyToClipboard(event, text) {
-                event.stopPropagation();
-                
-                navigator.clipboard.writeText(text).then(function() {
-                    var target = event.currentTarget;
-                    target.classList.add('copied');
-                    
-                    setTimeout(function() {
-                        target.classList.remove('copied');
-                    }, 1500);
-                }).catch(function(err) {
-                    console.error('Не удалось скопировать текст: ', err);
-                });
-                
-                // Предотвращаем выполнение других обработчиков
-                return false;
-            }
-            
-            // Функция для прокрутки к IP-адресу
-            function scrollToIP(ip) {
-                var ipElements = document.querySelectorAll('.ip-collapsible');
-                for (var i = 0; i < ipElements.length; i++) {
-                    if (ipElements[i].textContent.includes(ip)) {
-                        // Прокручиваем к элементу
-                        ipElements[i].scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        
-                        // Мигаем фоном для привлечения внимания
-                        ipElements[i].style.animation = 'highlight 2s';
-                        ipElements[i].style.boxShadow = '0 0 15px #3498db';
-                        
-                        setTimeout(function(elem) {
-                            return function() {
-                                elem.style.boxShadow = '';
-                                elem.style.animation = '';
-                            };
-                        }(ipElements[i]), 2000);
-                        
-                        // Открываем содержимое, если оно закрыто
-                        var ipId = 'ip_' + ip.replace(/\./g, '_');
-                        var content = document.getElementById(ipId);
-                        if (content && !content.style.maxHeight) {
-                            toggleIP(ipId);
-                        }
-                        break;
-                    }
-                }
-            }
-            
-            // Автоматически открыть первую секцию при загрузке
-            document.addEventListener("DOMContentLoaded", function() {
-                toggleSection('statsSection');
-            });
-        </script>
-    </body>
-    </html>
-    """
+        outgoing_connections = data[ip].get("Connections", {}).get("Outgoing", [])
+        incoming_connections = data[ip].get("Connections", {}).get("Incoming", [])
+        
+        # Добавляем все связанные IP в набор узлов
+        for conn_ip in outgoing_connections:
+            graph_nodes.add(conn_ip)
+        
+        for conn_ip in incoming_connections:
+            graph_nodes.add(conn_ip)
+        
+        # Сохраняем ребра графа
+        if outgoing_connections:
+            graph_edges[ip] = outgoing_connections
+    
+    # Загрузка шаблона из файла
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates', 'report_template.html')
+    
+    with open(template_path, 'r', encoding='utf-8') as f:
+        template_str = f.read()
     
     template = Template(template_str)
     
@@ -902,7 +220,9 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
         'sorted_ips': sorted_ips,
         'timestamp': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'get_threat_info_for_ip': get_threat_info_for_ip,
-        'get_threat_badge_class': get_threat_badge_class
+        'get_threat_badge_class': get_threat_badge_class,
+        'graph_nodes': list(graph_nodes),
+        'graph_edges': graph_edges
     }
     
     html_content = template.render(**context)
@@ -911,6 +231,209 @@ def generate_html_report(output_path: str, data: Dict[str, Any]) -> None:
         f.write(html_content)
     
     print(f"[*] HTML Report saved to '{output_path}'")
+
+
+def generate_simple_html_report(output_path: str, data: Dict[str, Any], title: str = "NetParser HTML Report") -> None:
+    """Генерирует простой статичный HTML-отчет без анимаций."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stats = data.get("Overall Packet Statistics", {})
+    ip_keys = [ip for ip in data.keys() if ip != "Overall Packet Statistics"]
+    sorted_ips = sorted(ip_keys, key=ip_sort_key)
+    blacklisted_count = sum(
+        1 for ip in sorted_ips if (data.get(ip, {}).get("Threat Info", {}) or {}).get("is_blacklisted")
+    )
+
+    def esc(value: Any) -> str:
+        return html.escape(str(value if value is not None else ""))
+
+    def render_kv_table(obj: Dict[str, Any]) -> str:
+        if not obj:
+            return '<div class="muted">Нет данных</div>'
+        rows = []
+        for key, value in obj.items():
+            rows.append(f"<tr><th>{esc(key)}</th><td>{esc(value)}</td></tr>")
+        return f"<table class='kv-table'>{''.join(rows)}</table>"
+
+    def render_list(items: Any) -> str:
+        if not items:
+            return '<div class="muted">Нет данных</div>'
+        if isinstance(items, dict):
+            return render_kv_table(items)
+        if not isinstance(items, list):
+            return f"<div>{esc(items)}</div>"
+        return "<ul>" + "".join(f"<li>{esc(item)}</li>" for item in items) + "</ul>"
+
+    def render_dns_queries_by_server(queries_map: Dict[str, List[str]]) -> str:
+        if not queries_map:
+            return '<div class="muted">Нет данных</div>'
+        blocks = []
+        for server_ip, queries in queries_map.items():
+            blocks.append(
+                f"<div class='sub-block'><div class='sub-title'>{esc(server_ip)}</div>{render_list(queries)}</div>"
+            )
+        return "".join(blocks)
+
+    def render_http_requests(requests: List[Dict[str, Any]]) -> str:
+        if not requests:
+            return '<div class="muted">Нет данных</div>'
+        rows = []
+        for req in requests:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(req.get('method', '-'))}</td>"
+                f"<td>{esc(req.get('host', '-'))}</td>"
+                f"<td>{esc(req.get('uri', '-'))}</td>"
+                f"<td>{esc(req.get('user_agent', '-'))}</td>"
+                "</tr>"
+            )
+        return (
+            "<table class='grid-table'><thead><tr><th>Method</th><th>Host</th><th>URI</th><th>User-Agent</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
+    def render_http_responses(responses: List[Dict[str, Any]]) -> str:
+        if not responses:
+            return '<div class="muted">Нет данных</div>'
+        rows = []
+        for resp in responses:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(resp.get('status_code', '-'))}</td>"
+                f"<td>{esc(resp.get('status_message', '-'))}</td>"
+                f"<td>{esc(resp.get('content_type', '-'))}</td>"
+                f"<td>{esc(resp.get('content_length', '-'))}</td>"
+                "</tr>"
+            )
+        return (
+            "<table class='grid-table'><thead><tr><th>Status</th><th>Message</th><th>Content-Type</th><th>Length</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
+    ip_sections = []
+    for ip in sorted_ips:
+        info = data.get(ip, {})
+        threat_info = info.get("Threat Info", {})
+        traffic = info.get("Traffic", {})
+        protocols = info.get("Protocols", {})
+        connections = info.get("Connections", {})
+        dns_associations = info.get("DNS Associations", [])
+        dns_queries = info.get("DNS Queries by Server", {}) or {}
+        dns_responses = info.get("DNS Responses", []) or []
+        dns_chains = info.get("DNS Resolution Chains", []) or []
+        sni_records = info.get("SNI Records", [])
+        http_domains = info.get("HTTP Domains", [])
+        http_requests = info.get("HTTP Requests", [])
+        http_responses = info.get("HTTP Responses", [])
+
+        threat_label = "Безопасный"
+        if threat_info.get("is_blacklisted"):
+            threat_label = f"{threat_info.get('threat_level', 'Threat')} ({threat_info.get('threat_score', 0)})"
+
+        ip_sections.append(
+            f"""
+            <section class="ip-card" id="ip-{esc(ip)}">
+                <h2>{esc(ip)}</h2>
+                <div class="meta-line">ASN: <b>{esc(info.get("ASN", "Unknown"))}</b> | Threat: <b>{esc(threat_label)}</b></div>
+                <div class="grid">
+                    <div class="block"><h3>Traffic</h3>{render_kv_table(traffic)}</div>
+                    <div class="block"><h3>Protocols</h3>{render_kv_table(protocols)}</div>
+                </div>
+                <div class="grid">
+                    <div class="block"><h3>Connections: Outgoing</h3>{render_list(connections.get("Outgoing", []))}</div>
+                    <div class="block"><h3>Connections: Incoming</h3>{render_list(connections.get("Incoming", []))}</div>
+                </div>
+                <div class="grid">
+                    <div class="block"><h3>DNS Associations</h3>{render_list(dns_associations)}</div>
+                    <div class="block"><h3>DNS Queries by Server</h3>{render_dns_queries_by_server(dns_queries)}</div>
+                </div>
+                <div class="grid">
+                    <div class="block"><h3>DNS Responses</h3>{render_list(dns_responses)}</div>
+                    <div class="block"><h3>DNS Resolution Chains</h3>{render_list(dns_chains)}</div>
+                </div>
+                <div class="grid">
+                    <div class="block"><h3>HTTP Domains</h3>{render_list(http_domains)}</div>
+                    <div class="block"><h3>TLS / SNI</h3>{render_list(sni_records)}</div>
+                </div>
+                <div class="grid">
+                    <div class="block"><h3>HTTP Requests</h3>{render_http_requests(http_requests)}</div>
+                    <div class="block"><h3>HTTP Responses</h3>{render_http_responses(http_responses)}</div>
+                </div>
+                <details class="raw-json">
+                    <summary>Raw JSON for this IP</summary>
+                    <pre>{esc(json.dumps(info, ensure_ascii=False, indent=2))}</pre>
+                </details>
+            </section>
+            """
+        )
+
+    html_content = f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(title)}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f7f8fa; color: #1f2937; }}
+    .container {{ max-width: 1320px; margin: 0 auto; padding: 24px; }}
+    .header {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px 20px; margin-bottom: 16px; }}
+    .header h1 {{ margin: 0 0 8px; font-size: 22px; }}
+    .muted {{ color: #64748b; font-size: 13px; }}
+    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }}
+    .stat {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; }}
+    .stat .label {{ font-size: 12px; color: #64748b; }}
+    .stat .value {{ font-size: 18px; font-weight: 600; margin-top: 4px; }}
+    .toc {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; }}
+    .toc ul {{ margin: 0; padding-left: 18px; column-count: 3; column-gap: 24px; }}
+    .toc li {{ break-inside: avoid; margin: 4px 0; }}
+    .toc a {{ color: #1d4ed8; text-decoration: none; }}
+    .ip-card {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; margin-bottom: 14px; }}
+    .ip-card h2 {{ margin: 0; font-size: 20px; }}
+    .meta-line {{ margin-top: 6px; margin-bottom: 10px; color: #334155; }}
+    .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }}
+    .block {{ border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; min-width: 0; }}
+    .block h3 {{ margin: 0 0 8px; font-size: 14px; }}
+    .kv-table, .grid-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    .kv-table th, .kv-table td, .grid-table th, .grid-table td {{ border-bottom: 1px solid #eef2f7; text-align: left; padding: 6px 4px; vertical-align: top; }}
+    .kv-table th, .grid-table th {{ width: 32%; color: #475569; font-weight: 600; }}
+    ul {{ margin: 0; padding-left: 18px; font-size: 12px; }}
+    .sub-block {{ margin-bottom: 8px; }}
+    .sub-title {{ font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 3px; }}
+    .raw-json summary {{ cursor: pointer; color: #1d4ed8; }}
+    .raw-json pre {{ margin: 8px 0 0; background: #0b1020; color: #e5e7eb; padding: 10px; border-radius: 8px; overflow: auto; font-size: 12px; }}
+    @media (max-width: 960px) {{
+      .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .grid {{ grid-template-columns: 1fr; }}
+      .toc ul {{ column-count: 1; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>{esc(title)}</h1>
+      <div class="muted">Сформирован: {esc(timestamp)}</div>
+      <div class="stats">
+        <div class="stat"><div class="label">Всего IP</div><div class="value">{len(sorted_ips)}</div></div>
+        <div class="stat"><div class="label">Подозрительные IP</div><div class="value">{blacklisted_count}</div></div>
+        <div class="stat"><div class="label">Всего пакетов</div><div class="value">{esc(stats.get("total_packets", 0))}</div></div>
+        <div class="stat"><div class="label">Протокольных метрик</div><div class="value">{len(stats)}</div></div>
+      </div>
+    </header>
+    <section class="toc">
+      <div class="muted" style="margin-bottom: 6px;">Навигация по IP</div>
+      <ul>
+        {"".join(f'<li><a href="#ip-{esc(ip)}">{esc(ip)}</a></li>' for ip in sorted_ips)}
+      </ul>
+    </section>
+    {"".join(ip_sections)}
+  </div>
+</body>
+</html>"""
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
+    print(f"[*] Simple HTML Report saved to '{output_path}'")
 
 def print_report(report_data: Dict[str, Any]) -> None:
     """
