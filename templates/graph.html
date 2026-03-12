@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetParser Pro - Анализ графа сети</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <link rel="stylesheet" href="/static/css/graph.css">
+</head>
+<body>
+    <nav class="topbar">
+        <div class="container-fluid topbar-inner">
+            <a class="brand" href="/">
+                <i class="fas fa-network-wired"></i>
+                <span>NetParser Pro</span>
+            </a>
+            <div class="topbar-links">
+                <a class="top-link" href="/">Дашборд</a>
+                <a class="top-link active" href="/graph">Граф</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container-fluid page-wrap">
+        <div id="loadingState" class="state-block">
+            <div class="spinner-border text-primary" role="status"></div>
+            <p>Загружаем последние данные анализа...</p>
+        </div>
+        <div id="errorState" class="alert alert-danger d-none" role="alert"></div>
+
+        <section id="graphWorkspace" class="workspace d-none">
+            <aside class="sidebar">
+                <div class="panel stats-panel">
+                    <div class="stat-item">
+                        <span class="stat-label">Узлы</span>
+                        <span class="stat-value" id="statNodes">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Связи</span>
+                        <span class="stat-value" id="statEdges">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Подозрительные</span>
+                        <span class="stat-value danger" id="statRisky">0</span>
+                    </div>
+                </div>
+
+                <div class="panel controls-panel">
+                    <label class="control-label" for="searchInput">Быстрый поиск IP</label>
+                    <input id="searchInput" class="form-control form-control-sm" type="text" placeholder="Например, 10.0.2.15">
+                    <div class="control-row">
+                        <button id="searchBtn" class="btn btn-primary btn-sm">Найти</button>
+                        <button id="clearBtn" class="btn btn-outline-secondary btn-sm">Сброс</button>
+                    </div>
+                    <div class="form-check form-switch mt-3">
+                        <input class="form-check-input" type="checkbox" id="riskyOnly">
+                        <label class="form-check-label" for="riskyOnly">Только подозрительные</label>
+                    </div>
+                    <div class="mini-legend">
+                        <span><i class="dot safe"></i> Обычный хост</span>
+                        <span><i class="dot dns"></i> DNS-сервер</span>
+                        <span><i class="dot risk"></i> Подозрительный</span>
+                    </div>
+                </div>
+
+                <div class="panel details-panel">
+                    <h6 class="panel-title">Детали выбора</h6>
+                    <div id="nodeDetails" class="muted">
+                        Выберите узел на графе, чтобы увидеть детали.
+                    </div>
+                </div>
+            </aside>
+
+            <section class="graph-stage">
+                <div class="graph-toolbar">
+                    <button id="zoomInBtn" class="btn btn-outline-secondary btn-sm" title="Увеличить">
+                        <i class="fas fa-plus"></i>
+                    </button>
+                    <button id="zoomOutBtn" class="btn btn-outline-secondary btn-sm" title="Уменьшить">
+                        <i class="fas fa-minus"></i>
+                    </button>
+                    <button id="fitBtn" class="btn btn-outline-secondary btn-sm" title="Центрировать">
+                        <i class="fas fa-crosshairs"></i>
+                    </button>
+                </div>
+                <div id="networkGraph" class="graph-canvas"></div>
+            </section>
+        </section>
+    </main>
+
+    <script src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/graphology-layout@0.6.1/build/graphology-layout.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/graphology-layout-forceatlas2@0.10.1/build/graphology-layout-forceatlas2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sigma@2.4.0/build/sigma.min.js"></script>
+    <script>
+        (function () {
+            function injectScript(src) {
+                var tag = document.createElement("script");
+                tag.src = src;
+                document.head.appendChild(tag);
+            }
+            if (!window.graphology) {
+                injectScript("https://unpkg.com/graphology@0.25.4/dist/graphology.umd.min.js");
+            }
+            if (!window.graphologyLayoutForceatlas2) {
+                injectScript("https://unpkg.com/graphology-layout-forceatlas2@0.10.1/build/graphology-layout-forceatlas2.min.js");
+            }
+            if (!(window.Sigma || window.sigma)) {
+                injectScript("https://unpkg.com/sigma@2.4.0/build/sigma.min.js");
+            }
+        })();
+    </script>
+    <script src="/static/js/graph.js"></script>
+</body>
+</html>

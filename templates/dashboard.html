@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetParser Pro - Анализ сетевого трафика</title>
+    
+    <!-- Google Fonts - Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <!-- Font Awesome 6 Pro -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    
+    <!-- Animate.css для анимаций -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    
+    <!-- DataTables CSS -->
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    
+    <!-- Apexcharts -->
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    
+</head>
+<body data-page="dashboard">
+    <!-- Панель навигации -->
+    <nav class="navbar navbar-expand-lg navbar-dark sticky-top">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">
+                <i class="fas fa-network-wired me-2"></i>NetParser Pro
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="/">
+                            <i class="fas fa-table-columns me-1"></i> Дэшборд
+                        </a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="/graph">
+                            <i class="fas fa-diagram-project me-1"></i> Граф
+                        </a>
+                    </li>
+                </ul>
+                <div class="d-flex align-items-center gap-2 ms-3">
+                    <a id="openHtmlReportBtn" class="btn btn-outline-light btn-sm d-none" href="#" role="button">
+                        <i class="fas fa-file-export me-1"></i> Экспорт HTML
+                    </a>
+                    <div class="dark-mode-toggle" id="darkModeToggle">
+                        <i class="fas fa-moon"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </nav>
+    
+    <!-- Главный контейнер -->
+    <div class="container-fluid py-4">
+        <!-- Секция загрузки файлов -->
+        <section id="upload-section" class="card shadow-sm mb-4 animate__animated animate__fadeIn">
+            <div class="card-header">
+                <h3 class="card-title"><i class="fas fa-upload me-2"></i>Загрузка файлов для анализа</h3>
+            </div>
+            <div class="card-body">
+                <ul class="nav nav-tabs" id="fileTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="single-tab" data-bs-toggle="tab" data-bs-target="#single-pane" type="button" role="tab">
+                            <i class="fas fa-file me-1"></i> Один файл
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="compare-tab" data-bs-toggle="tab" data-bs-target="#compare-pane" type="button" role="tab">
+                            <i class="fas fa-code-compare me-1"></i> Сравнение файлов
+                        </button>
+                    </li>
+                </ul>
+                <div class="tab-content pt-4" id="fileTabsContent">
+                    <!-- Загрузка одного файла -->
+                    <div class="tab-pane fade show active" id="single-pane" role="tabpanel">
+                        <form id="singleFileForm" class="row g-3">
+                            <div class="col-md-6">
+                                <label for="singleFile" class="form-label">PCAP-файл для анализа</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="fas fa-file-packet"></i></span>
+                                    <input type="file" class="form-control" id="singleFile" accept=".pcap,.pcapng">
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <label for="threads" class="form-label">Количество потоков</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="fas fa-microchip"></i></span>
+                                    <input type="number" class="form-control" id="threads" min="1" max="{{ cpu_count }}" value="{{ default_threads|default(4) }}">
+                                </div>
+                                <div class="form-text">Доступно {{ cpu_count|default(4) }} ядер CPU</div>
+                            </div>
+                            <div class="col-md-3 align-self-end">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="checkBlacklists" checked>
+                                    <label class="form-check-label" for="checkBlacklists">Проверять черные списки</label>
+                                </div>
+                            </div>
+                            <div class="col-12">
+                                <button type="submit" class="btn btn-primary">
+                                    <i class="fas fa-play me-2"></i> Начать анализ
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                    
+                    <!-- Сравнение файлов -->
+                    <div class="tab-pane fade" id="compare-pane" role="tabpanel">
+                        <form id="compareFilesForm" class="row g-3">
+                            <div class="col-md-6">
+                                <label for="baseFile" class="form-label">Базовый PCAP-файл</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="fas fa-file-lines"></i></span>
+                                    <input type="file" class="form-control" id="baseFile" accept=".pcap,.pcapng">
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <label for="compareFile" class="form-label">Сравниваемый PCAP-файл</label>
+                                <div class="input-group">
+                                    <span class="input-group-text"><i class="fas fa-file-lines"></i></span>
+                                    <input type="file" class="form-control" id="compareFile" accept=".pcap,.pcapng">
+                                </div>
+                            </div>
+                            <div class="col-12">
+                                <button type="submit" class="btn btn-primary">
+                                    <i class="fas fa-code-compare me-2"></i> Сравнить файлы
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </section>
+        
+        <!-- Индикатор загрузки -->
+        <div id="loadingIndicator" class="text-center d-none animate__animated animate__fadeIn mb-4">
+            <div class="spinner-container">
+                <div class="spinner-border text-primary mb-3" style="width: 3rem; height: 3rem;" role="status"></div>
+                <h4 class="mb-2">Анализ данных...</h4>
+                <p class="text-muted">Пожалуйста, подождите. Это может занять некоторое время в зависимости от размера файла.</p>
+            </div>
+        </div>
+        
+        <!-- Сообщение об ошибке -->
+        <div id="errorAlert" class="alert alert-danger d-none animate__animated animate__fadeIn mb-4" role="alert">
+            <i class="fas fa-exclamation-triangle me-2"></i>
+            <span id="errorMessage">Произошла ошибка при обработке файла.</span>
+        </div>
+        
+        <!-- Секция с ключевыми метриками -->
+        <section id="dashboard-section" class="mb-4 d-none animate__animated animate__fadeIn">
+            <div class="row">
+                <div class="col-md-3 mb-4">
+                    <div class="metric-card primary">
+                        <i class="fas fa-network-wired"></i>
+                        <div class="metric-value" id="totalPackets">0</div>
+                        <div class="metric-title">Всего пакетов</div>
+                    </div>
+                </div>
+                <div class="col-md-3 mb-4">
+                    <div class="metric-card success">
+                        <i class="fas fa-globe"></i>
+                        <div class="metric-value" id="uniqueIPs">0</div>
+                        <div class="metric-title">Уникальных IP-адресов</div>
+                    </div>
+                </div>
+                <div class="col-md-3 mb-4">
+                    <div class="metric-card warning">
+                        <i class="fas fa-database"></i>
+                        <div class="metric-value" id="totalTraffic">0</div>
+                        <div class="metric-title">Общий трафик</div>
+                    </div>
+                </div>
+                <div class="col-md-3 mb-4">
+                    <div class="metric-card danger">
+                        <i class="fas fa-shield-virus"></i>
+                        <div class="metric-value" id="suspiciousIPs">0</div>
+                        <div class="metric-title">Подозрительных IP</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Графики -->
+            <div class="row">
+                <div class="col-lg-6 mb-4">
+                    <div class="card shadow-sm h-100">
+                        <div class="card-header">
+                            <h4 class="card-title"><i class="fas fa-chart-pie me-2"></i>Распределение протоколов</h4>
+                        </div>
+                        <div class="card-body">
+                            <div id="protocolChart" class="w-100" style="height: 300px;"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-lg-6 mb-4">
+                    <div class="card shadow-sm h-100">
+                        <div class="card-header">
+                            <h4 class="card-title"><i class="fas fa-chart-column me-2"></i>Распределение трафика</h4>
+                        </div>
+                        <div class="card-body">
+                            <div id="trafficChart" class="w-100" style="height: 300px;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+        <!-- Секция анализа (объединенная) -->
+        <section id="analysis-section" class="d-none animate__animated animate__fadeIn">
+            <div class="row">
+                <!-- Список IP адресов -->
+                <div class="col-lg-4 mb-4">
+                    <div class="card shadow-sm h-100">
+                        <div class="card-header">
+                            <h3 class="card-title"><i class="fas fa-list me-2"></i>IP адреса</h3>
+                            <div class="card-actions">
+                                <input type="text" class="form-control form-control-sm" id="ipFilter" placeholder="Поиск: IP / ASN / DNS...">
+                            </div>
+                        </div>
+                        <div class="card-body p-0">
+                            <div class="ip-list" id="ipList">
+                                <!-- Заполняется динамически -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Детальная информация об IP -->
+                <div class="col-lg-8 mb-4">
+                    <div class="card shadow-sm h-100">
+                        <div class="card-header">
+                            <h3 class="card-title" id="ipDetailsTitle">
+                                <i class="fas fa-info-circle me-2"></i>Выберите IP для просмотра деталей
+                            </h3>
+                        </div>
+                        <div class="card-body" id="ipDetailsBody">
+                            <div class="text-center text-muted py-5">
+                                <i class="fas fa-mouse-pointer fs-1 mb-3"></i>
+                                <p>Кликните на IP адрес слева для просмотра подробной информации</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+    
+    <!-- Footer -->
+    <footer class="py-3 mt-auto bg-light">
+        <div class="container-fluid">
+            <div class="row">
+                <div class="col-md-6">
+                    <p class="mb-0 text-muted"><i class="fas fa-network-wired me-2"></i>NetParser Pro &copy; 2023 - Мощный инструмент анализа сетевого трафика</p>
+                </div>
+                <div class="col-md-6 text-md-end">
+                    <p class="mb-0 text-muted">
+                        <span class="me-3"><i class="fas fa-microchip me-1"></i>Оптимизировано для <span id="cpuCoresFooter">{{ cpu_count|default(4) }}</span> ядер</span>
+                        <span><i class="fas fa-code me-1"></i>v3.0</span>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </footer>
+    
+    <!-- Модальное окно детальной информации об IP -->
+    <div class="modal fade" id="ipDetailModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="ipDetailModalTitle">Подробная информация об IP</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body" id="ipDetailModalBody">
+                    <!-- Заполняется динамически -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- jQuery -->
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- DataTables JS -->
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+    
+    <!-- Custom JS -->
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html> 
